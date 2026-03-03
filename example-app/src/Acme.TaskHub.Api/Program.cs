@@ -76,28 +76,28 @@ builder.Services.AddApiVersioning(o =>
 }).AddMvc();
 
 // ----- Auth (Entra ID / Development bypass) -----
+// Policies are registered in ALL environments so [Authorize(Policy = "...")]
+// attributes work the same way in dev and prod. In Development a synthetic
+// DevAuthHandler auto-succeeds and issues the required scope claims.
 if (builder.Environment.IsDevelopment())
 {
-    // In Development, use a no-op authentication scheme so we can test without Entra ID.
     builder.Services
         .AddAuthentication("DevScheme")
         .AddScheme<Microsoft.AspNetCore.Authentication.AuthenticationSchemeOptions, DevAuthHandler>(
             "DevScheme", _ => { });
-
-    builder.Services.AddAuthorization();
 }
 else
 {
     builder.Services
         .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         .AddMicrosoftIdentityWebApi(builder.Configuration.GetSection("AzureAd"));
-
-    builder.Services.AddAuthorization(options =>
-    {
-        options.AddPolicy("Api.Read", policy => policy.RequireClaim("scp", "api.read"));
-        options.AddPolicy("Api.Write", policy => policy.RequireClaim("scp", "api.write"));
-    });
 }
+
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("Api.Read", policy => policy.RequireClaim("scp", "api.read"));
+    options.AddPolicy("Api.Write", policy => policy.RequireClaim("scp", "api.write"));
+});
 
 // ----- Validation -----
 builder.Services.AddFluentValidationAutoValidation();
@@ -110,6 +110,27 @@ builder.Services.AddInfrastructure(builder.Configuration);
 // ----- Health checks -----
 builder.Services.AddHealthChecks()
     .AddDbContextCheck<AppDbContext>("database");
+
+// ----- Resilience (Polly v8 via Microsoft.Extensions.Http.Resilience) -----
+// Registers a named HttpClient with a standard resilience pipeline per TRD §10:
+//   - Total request timeout: 30s
+//   - Retry: 3 attempts, exponential backoff with jitter for transient/5xx/429
+//   - Circuit breaker: opens after sustained failures
+//   - Per-attempt timeout: 10s (TRD §10.1 default)
+builder.Services.AddHttpClient("Downstream")
+    .AddStandardResilienceHandler(options =>
+    {
+        // TRD §10.1: Default per-attempt timeout 10s.
+        options.AttemptTimeout.Timeout = TimeSpan.FromSeconds(10);
+
+        // TRD §10.2: Max 3 retries with exponential backoff + jitter.
+        options.Retry.MaxRetryAttempts = 3;
+        options.Retry.BackoffType = Polly.DelayBackoffType.Exponential;
+        options.Retry.UseJitter = true;
+
+        // TRD §10.1: Total timeout 30s across all attempts.
+        options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(30);
+    });
 
 // ----- OpenTelemetry -----
 var otelBuilder = builder.Services.AddOpenTelemetry()
@@ -142,7 +163,9 @@ var otelBuilder = builder.Services.AddOpenTelemetry()
 
 var app = builder.Build();
 
-// ----- Ensure database is created (Development only) -----
+// ----- Ensure database is created (Development only — TRD §11.2) -----
+// In production, migrations are applied via a controlled pipeline step.
+// EnsureCreatedAsync is only used in Development for rapid iteration.
 if (app.Environment.IsDevelopment())
 {
     using var scope = app.Services.CreateScope();
@@ -246,7 +269,11 @@ internal sealed class DevAuthHandler
     {
         var identity = new System.Security.Claims.ClaimsIdentity("Development");
         identity.AddClaim(new System.Security.Claims.Claim("sub", "dev-user"));
-        identity.AddClaim(new System.Security.Claims.Claim("scp", "api.read api.write"));
+
+        // Issue individual scope claims so RequireClaim("scp", "api.read") and
+        // RequireClaim("scp", "api.write") policies succeed in development.
+        identity.AddClaim(new System.Security.Claims.Claim("scp", "api.read"));
+        identity.AddClaim(new System.Security.Claims.Claim("scp", "api.write"));
 
         var principal = new System.Security.Claims.ClaimsPrincipal(identity);
         var ticket = new Microsoft.AspNetCore.Authentication.AuthenticationTicket(principal, "DevScheme");

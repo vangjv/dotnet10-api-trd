@@ -15,6 +15,7 @@ namespace Acme.TaskHub.Api.Controllers.V1;
 [ApiVersion("1.0")]
 [Route("v{version:apiVersion}/todoitems")]
 [Produces("application/json")]
+[Authorize] // TRD §8.2: default deny — every endpoint requires auth.
 public sealed class TodoItemsController : ControllerBase
 {
     private readonly ITodoItemService _service;
@@ -49,7 +50,7 @@ public sealed class TodoItemsController : ControllerBase
     /// <response code="200">Returns the paged list.</response>
     /// <response code="400">Validation failed.</response>
     [HttpGet]
-    [AllowAnonymous]
+    [Authorize(Policy = "Api.Read")]
     [ProducesResponseType(typeof(PagedResult<TodoItemResponse>), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> GetAll(
@@ -75,7 +76,7 @@ public sealed class TodoItemsController : ControllerBase
     /// <response code="200">Returns the item.</response>
     /// <response code="404">Item not found.</response>
     [HttpGet("{id:guid}")]
-    [AllowAnonymous]
+    [Authorize(Policy = "Api.Read")]
     [ProducesResponseType(typeof(TodoItemResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> GetById(Guid id, CancellationToken cancellationToken)
@@ -98,7 +99,7 @@ public sealed class TodoItemsController : ControllerBase
     /// <response code="201">Item created successfully.</response>
     /// <response code="400">Validation failed.</response>
     [HttpPost]
-    [AllowAnonymous]
+    [Authorize(Policy = "Api.Write")]
     [ProducesResponseType(typeof(TodoItemResponse), StatusCodes.Status201Created)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> Create(
@@ -126,7 +127,7 @@ public sealed class TodoItemsController : ControllerBase
     /// <response code="400">Validation failed.</response>
     /// <response code="404">Item not found.</response>
     [HttpPut("{id:guid}")]
-    [AllowAnonymous]
+    [Authorize(Policy = "Api.Write")]
     [ProducesResponseType(typeof(TodoItemResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
@@ -162,7 +163,7 @@ public sealed class TodoItemsController : ControllerBase
     /// <response code="404">Item not found.</response>
     /// <response code="409">Invalid status transition.</response>
     [HttpPatch("{id:guid}/status")]
-    [AllowAnonymous]
+    [Authorize(Policy = "Api.Write")]
     [ProducesResponseType(typeof(TodoItemResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
@@ -196,7 +197,7 @@ public sealed class TodoItemsController : ControllerBase
     /// <response code="204">Item deleted successfully.</response>
     /// <response code="404">Item not found.</response>
     [HttpDelete("{id:guid}")]
-    [AllowAnonymous]
+    [Authorize(Policy = "Api.Write")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> Delete(Guid id, CancellationToken cancellationToken)

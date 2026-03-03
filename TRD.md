@@ -74,6 +74,30 @@ These SLOs apply per service, per production environment, measured at the **API 
   - `GET /health/live`
   - `GET /health/ready`
 
+**Reference Dockerfile**
+```dockerfile
+# Build stage
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+COPY . .
+RUN dotnet restore
+RUN dotnet publish ./src/Company.Product.Service.Api/Company.Product.Service.Api.csproj \
+    -c Release -o /app/publish
+
+# Runtime stage
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+
+# Run as non-root user (TRD §3.1)
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+USER appuser
+
+WORKDIR /app
+COPY --from=build /app/publish .
+ENV ASPNETCORE_URLS=http://+:8080
+EXPOSE 8080
+ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
+```
+
 **Must**
 - Use **Managed Identity** for Azure resources where supported (Key Vault, Azure SQL with AAD, App Configuration).
 - Configure **ingress** to HTTPS only; TLS terminated at platform edge.
@@ -111,7 +135,8 @@ These SLOs apply per service, per production environment, measured at the **API 
 ### 4.4 Validation and mapping
 - **FluentValidation.AspNetCore** (request validation)
 - Mapping:
-  - Approved: **AutoMapper** *or* **Mapster** (choose 1 per service; org default: AutoMapper)
+  - **Manual mapping via extension methods** (preferred for simple models — compile-time safe, no reflection)
+  - No third-party mapping library (e.g., AutoMapper, Mapster) required. If one is adopted per service, ensure it is consistent throughout that service.
 
 ### 4.5 Observability
 - **OpenTelemetry**:
@@ -125,8 +150,10 @@ These SLOs apply per service, per production environment, measured at the **API 
   - Sinks: Console + (optional) Application Insights sink if required by org
 
 ### 4.6 Resilience
-- **Polly** (timeouts, retries, circuit breakers) using typed `HttpClient` policies
-  - Polly.Extensions.Http (if needed for helpers)
+- **Microsoft.Extensions.Http.Resilience** (wraps **Polly v8** for `HttpClient` resilience pipelines)
+  - Provides `AddStandardResilienceHandler()` with built-in retry, circuit breaker, and timeout
+  - Configure per-attempt timeout, total timeout, retry count, backoff strategy, and jitter
+- For non-HTTP resilience (e.g., custom pipelines), use **Polly** v8+ directly (`ResiliencePipelineBuilder`)
 
 ### 4.7 Testing
 - **xUnit**
@@ -254,6 +281,15 @@ These SLOs apply per service, per production environment, measured at the **API 
 **Must**
 - Policy-based authorization with scope/role checks.
 - Default deny; endpoints explicitly require a policy.
+- Register policies in **all environments** (including Development) so `[Authorize(Policy = "...")]` attributes are always evaluated.
+
+### 8.2.1 Development authentication
+**Must**
+- In Development, use a synthetic `AuthenticationHandler` that:
+  - Auto-succeeds authentication (no token required).
+  - Issues claims matching all defined authorization policies (e.g., individual `scp` claims for `api.read`, `api.write`).
+- **Never** use `[AllowAnonymous]` on production-secured endpoints as a dev convenience.
+- This ensures the authorization pipeline is exercised identically in dev and prod.
 
 ### 8.3 Data protection and secrets
 **Must**
@@ -332,6 +368,11 @@ These SLOs apply per service, per production environment, measured at the **API 
 - Production migration strategy:
   - Apply via controlled pipeline step with approvals.
 - Never auto-migrate on startup in production.
+
+**Development/testing exception:**
+- `EnsureCreated()` or `EnsureCreatedAsync()` is acceptable in **Development** and **test** environments for rapid iteration.
+- Guard with an environment check: only call `EnsureCreated` when `IsDevelopment()` is true.
+- The migration infrastructure (EF Core Design package, migrations folder) must still exist in source control even if not used at dev time.
 
 ### 11.3 Query performance
 **Must**

@@ -19,7 +19,11 @@ public static class DependencyInjection
     {
         services.AddDbContext<AppDbContext>(options =>
         {
-            options.UseSqlite(config.GetConnectionString("Default"));
+            options.UseSqlite(config.GetConnectionString("Default"), sqlite =>
+            {
+                // TRD §10.1: Default DB command timeout 30s.
+                sqlite.CommandTimeout(30);
+            });
         });
 
         services.AddScoped<ITodoItemRepository, TodoItemRepository>();
