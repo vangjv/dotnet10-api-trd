@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Acme.TaskHub.Domain</AssemblyName>
+    <RootNamespace>Acme.TaskHub.Domain</RootNamespace>
+  </PropertyGroup>
+</Project>

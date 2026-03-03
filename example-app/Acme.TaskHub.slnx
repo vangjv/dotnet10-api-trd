@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Acme.TaskHub.Api/Acme.TaskHub.Api.csproj" />
+    <Project Path="src/Acme.TaskHub.Application/Acme.TaskHub.Application.csproj" />
+    <Project Path="src/Acme.TaskHub.Domain/Acme.TaskHub.Domain.csproj" />
+    <Project Path="src/Acme.TaskHub.Infrastructure/Acme.TaskHub.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Acme.TaskHub.Tests.Integration/Acme.TaskHub.Tests.Integration.csproj" />
+    <Project Path="tests/Acme.TaskHub.Tests.Unit/Acme.TaskHub.Tests.Unit.csproj" />
+  </Folder>
+</Solution>
