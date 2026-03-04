@@ -1,16 +1,13 @@
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Acme.TaskHub.Api.Auth;
 using Acme.TaskHub.Application;
 using Acme.TaskHub.Domain.Exceptions;
 using Acme.TaskHub.Infrastructure;
-using Acme.TaskHub.Infrastructure.Persistence;
 using Azure.Monitor.OpenTelemetry.Exporter;
-using FluentValidation;
-using FluentValidation.AspNetCore;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.EntityFrameworkCore;
 using Microsoft.Identity.Web;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Trace;
@@ -22,14 +19,6 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Host.UseSerilog((ctx, cfg) =>
 {
     cfg.ReadFrom.Configuration(ctx.Configuration);
-});
-
-// ----- JSON serialization (System.Text.Json with TRD conventions) -----
-builder.Services.ConfigureHttpJsonOptions(options =>
-{
-    options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
-    options.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
-    options.SerializerOptions.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
 });
 
 // ----- Controllers + API Behavior -----
@@ -99,17 +88,16 @@ builder.Services.AddAuthorization(options =>
     options.AddPolicy("Api.Write", policy => policy.RequireClaim("scp", "api.write"));
 });
 
-// ----- Validation -----
-builder.Services.AddFluentValidationAutoValidation();
-builder.Services.AddValidatorsFromAssemblyContaining<Program>();
+// ----- Validation (manual — see controllers) -----
+// Validators are registered in AddApplication() within the Application assembly.
+// Do NOT call AddFluentValidationAutoValidation() — it conflicts with manual validation
+// and produces inconsistent ValidationProblemDetails (TRD §4.4).
 
 // ----- Application + Infrastructure services -----
 builder.Services.AddApplication();
 builder.Services.AddInfrastructure(builder.Configuration);
 
-// ----- Health checks -----
-builder.Services.AddHealthChecks()
-    .AddDbContextCheck<AppDbContext>("database");
+// Health checks are registered inside AddInfrastructure (TRD §5.3, §5.6).
 
 // ----- Resilience (Polly v8 via Microsoft.Extensions.Http.Resilience) -----
 // Registers a named HttpClient with a standard resilience pipeline per TRD §10:
@@ -164,14 +152,8 @@ var otelBuilder = builder.Services.AddOpenTelemetry()
 var app = builder.Build();
 
 // ----- Ensure database is created (Development only — TRD §11.2) -----
-// In production, migrations are applied via a controlled pipeline step.
-// EnsureCreatedAsync is only used in Development for rapid iteration.
-if (app.Environment.IsDevelopment())
-{
-    using var scope = app.Services.CreateScope();
-    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    await db.Database.EnsureCreatedAsync().ConfigureAwait(false);
-}
+// Encapsulated in Infrastructure to avoid referencing AppDbContext in Program.cs (TRD §5.3).
+await app.InitializeDatabaseAsync();
 
 // ----- Pipeline -----
 app.UseSerilogRequestLogging();
@@ -241,46 +223,6 @@ app.MapHealthChecks("/health/ready", new Microsoft.AspNetCore.Diagnostics.Health
 });
 
 app.Run();
-
-// ----- Development auth handler (auto-succeeds; non-production only) -----
-
-/// <summary>
-/// A no-op authentication handler for local development.
-/// Automatically authenticates all requests so endpoints can be tested without Entra ID.
-/// </summary>
-internal sealed class DevAuthHandler
-    : Microsoft.AspNetCore.Authentication.AuthenticationHandler<
-        Microsoft.AspNetCore.Authentication.AuthenticationSchemeOptions>
-{
-    /// <summary>
-    /// Initializes a new instance of the <see cref="DevAuthHandler"/> class.
-    /// </summary>
-    public DevAuthHandler(
-        Microsoft.Extensions.Options.IOptionsMonitor<
-            Microsoft.AspNetCore.Authentication.AuthenticationSchemeOptions> options,
-        Microsoft.Extensions.Logging.ILoggerFactory logger,
-        System.Text.Encodings.Web.UrlEncoder encoder)
-        : base(options, logger, encoder)
-    {
-    }
-
-    /// <inheritdoc />
-    protected override Task<Microsoft.AspNetCore.Authentication.AuthenticateResult> HandleAuthenticateAsync()
-    {
-        var identity = new System.Security.Claims.ClaimsIdentity("Development");
-        identity.AddClaim(new System.Security.Claims.Claim("sub", "dev-user"));
-
-        // Issue individual scope claims so RequireClaim("scp", "api.read") and
-        // RequireClaim("scp", "api.write") policies succeed in development.
-        identity.AddClaim(new System.Security.Claims.Claim("scp", "api.read"));
-        identity.AddClaim(new System.Security.Claims.Claim("scp", "api.write"));
-
-        var principal = new System.Security.Claims.ClaimsPrincipal(identity);
-        var ticket = new Microsoft.AspNetCore.Authentication.AuthenticationTicket(principal, "DevScheme");
-
-        return Task.FromResult(Microsoft.AspNetCore.Authentication.AuthenticateResult.Success(ticket));
-    }
-}
 
 /// <summary>
 /// Marker type for the API assembly (used by WebApplicationFactory and integration tests).

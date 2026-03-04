@@ -133,7 +133,37 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
 - Provider package per DB (e.g., **Microsoft.EntityFrameworkCore.SqlServer**)
 
 ### 4.4 Validation and mapping
-- **FluentValidation.AspNetCore** (request validation)
+- **FluentValidation** + **FluentValidation.DependencyInjectionExtensions** (request validation)
+  > ⚠️ `FluentValidation.AspNetCore` is **deprecated** — do **not** reference it.
+  - Register validators in the **Application layer's `AddApplication()` extension method** via `AddValidatorsFromAssemblyContaining<T>()` where `T` is a type in the Application assembly.
+  - **Never** call `AddFluentValidationAutoValidation()` — it conflicts with manual validation and produces inconsistent `ValidationProblemDetails` shapes.
+  - **Never** call `AddValidatorsFromAssemblyContaining<Program>()` from `Program.cs` — all validators live in the Application assembly, making this a no-op that silently leaves validators unregistered.
+  - Use **manual validation** in each controller action: inject `IValidator<T>`, call `ValidateAsync`, and return `ValidationProblemDetails` on failure.
+
+  **Correct pattern (Application layer `DependencyInjection.cs`):**
+  ```csharp
+  // Application/DependencyInjection.cs
+  public static IServiceCollection AddApplication(this IServiceCollection services)
+  {
+      services.AddScoped<IMyService, MyService>();
+      // Register all validators from this assembly — the APPLICATION assembly.
+      services.AddValidatorsFromAssemblyContaining<MyService>();
+      return services;
+  }
+  ```
+
+  **Correct manual validation pattern (controller action):**
+  ```csharp
+  public async Task<IActionResult> Create(
+      [FromBody] CreateTodoItemRequest request,
+      CancellationToken cancellationToken)
+  {
+      var validation = await _validator.ValidateAsync(request, cancellationToken);
+      if (!validation.IsValid)
+          return ValidationProblem(validation.ToDictionary());
+      // ...
+  }
+  ```
 - Mapping:
   - **Manual mapping via extension methods** (preferred for simple models — compile-time safe, no reflection)
   - No third-party mapping library (e.g., AutoMapper, Mapster) required. If one is adopted per service, ensure it is consistent throughout that service.
@@ -165,6 +195,26 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
 ### 4.8 Analyzers and style
 **Must**
 - Enable .NET analyzers + treat warnings as errors in CI.
+- Use a **`Directory.Build.props`** file at the repository root to enforce analyzer settings across all projects from a single place.
+
+  **Reference `Directory.Build.props`:**
+  ```xml
+  <Project>
+    <PropertyGroup>
+      <Nullable>enable</Nullable>
+      <ImplicitUsings>enable</ImplicitUsings>
+      <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+      <AnalysisLevel>latest</AnalysisLevel>
+      <GenerateDocumentationFile>true</GenerateDocumentationFile>
+      <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    </PropertyGroup>
+    <ItemGroup>
+      <PackageReference Include="Microsoft.CodeAnalysis.NetAnalyzers" Version="x.x.x" PrivateAssets="all" />
+      <PackageReference Include="StyleCop.Analyzers" Version="x.x.x" PrivateAssets="all" />
+    </ItemGroup>
+  </Project>
+  ```
+
 **Approved**
 - **Microsoft.CodeAnalysis.NetAnalyzers**
 - **StyleCop.Analyzers** (optional but recommended)
@@ -180,6 +230,14 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
   - `Api -> Application -> Domain`
   - `Infrastructure -> Application` (implements interfaces)
 - `Domain` must not depend on EF Core or any external packages.
+
+**Required layer responsibilities:**
+| Layer | External packages allowed | Notes |
+|-------|--------------------------|-------|
+| Domain | _(none)_ | Pure C# only; no framework or ORM references |
+| Application | FluentValidation, DI/Logging abstractions | Owns interfaces for infra concerns |
+| Infrastructure | EF Core, provider, resilience | Implements Application interfaces |
+| Api | ASP.NET Core, Identity, OTel, Serilog | Composition root only |
 
 ### 5.2 Reference repo layout (required)
 ```
@@ -202,12 +260,33 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
 - No direct EF Core usage in controllers.
 - Standardize responses and errors (RFC 7807 Problem Details).
 - Provide OpenAPI descriptions for every endpoint.
+- **`Program.cs` must not reference any infrastructure types directly** (e.g., `AppDbContext`, concrete repositories). All infrastructure setup — including health checks and database initialization — must be encapsulated in `AddInfrastructure()` and a companion `UseInfrastructure()` / `InitializeDatabaseAsync()` extension on `IHost` or `WebApplication` defined in the Infrastructure layer.
+- **`DevAuthHandler` must live in a dedicated file** (e.g., `Auth/DevAuthHandler.cs` in the API project), not inline in `Program.cs`. Embedding a 30+ line class in the composition root adds noise and obscures startup logic.
+- **Swagger/OpenAPI service registration must be gated behind `IsDevelopment()`** to avoid unnecessary overhead in production environments.
+
+  ```csharp
+  // ✅ Correct composition root — no infrastructure types referenced directly
+  builder.Services.AddApplication();
+  builder.Services.AddInfrastructure(builder.Configuration); // health checks registered inside
+  // ...
+  await app.InitializeDatabaseAsync(); // defined in Infrastructure; handles dev EnsureCreated
+  ```
 
 ### 5.4 Application layer rules
 **Must**
 - Define use cases (commands/queries/services) that coordinate domain + infrastructure.
 - Own transaction boundaries (unit of work) if needed.
-- Define interfaces for infrastructure concerns (repositories, external clients).
+- **Define interfaces for infrastructure concerns (repositories, external clients) in an `Interfaces/` folder** within the Application project. Concrete implementations live in Infrastructure.
+- **Register all layer services (including validators) in a single `AddApplication()` extension method** on `IServiceCollection`. The composition root should call only this method — never register individual application services from `Program.cs`.
+- **Use `sealed record` with `init`-only required properties for all request/response DTOs** to prevent mutation and ensure immutability:
+  ```csharp
+  public sealed record CreateTodoItemRequest
+  {
+      public required string Title { get; init; }
+      public required Priority Priority { get; init; }
+  }
+  ```
+- **Service interfaces** (`IMyService`) should be co-located with their DTOs/models or placed in `Services/`, and **must not** be in the same folder as `ITodoItemRepository`-style repository interfaces (which live in `Interfaces/`).
 
 ### 5.5 Domain layer rules
 **Must**
@@ -219,6 +298,26 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
 - EF Core DbContext, configurations, migrations.
 - External service clients with resilience policies and timeouts.
 - No business logic beyond persistence and integration concerns.
+- **Expose a single `AddInfrastructure(IServiceCollection, IConfiguration)` extension method** that registers all infrastructure services including: DbContext, repositories, health checks.
+- **Expose an `InitializeDatabaseAsync(this IHost)` extension method** for development database initialization. This keeps infrastructure concerns out of the composition root:
+  ```csharp
+  public static async Task InitializeDatabaseAsync(this IHost host)
+  {
+      using var scope = host.Services.CreateScope();
+      var env = scope.ServiceProvider.GetRequiredService<IHostEnvironment>();
+      if (env.IsDevelopment())
+      {
+          var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+          await db.Database.EnsureCreatedAsync().ConfigureAwait(false);
+      }
+  }
+  ```
+- **Use `ApplyConfigurationsFromAssembly(Assembly.GetExecutingAssembly())`** in `OnModelCreating` to auto-discover all `IEntityTypeConfiguration<T>` implementations. This avoids having to manually register each entity configuration:
+  ```csharp
+  protected override void OnModelCreating(ModelBuilder modelBuilder)
+      => modelBuilder.ApplyConfigurationsFromAssembly(Assembly.GetExecutingAssembly());
+  ```
+- Keep entity constants (`MaxTitleLength`, etc.) on the **domain entity**, referenced by both in EF configuration and FluentValidation validators — single source of truth.
 
 ---
 
@@ -245,6 +344,22 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
 **Must**
 - `application/json` only unless exception approved.
 - Use `System.Text.Json` with deterministic settings (camelCase, enums as strings if chosen).
+- **For MVC controller applications, configure JSON options on `AddControllers()`** via `.AddJsonOptions()`. Do **not** use `ConfigureHttpJsonOptions()` — this applies to minimal API endpoints only and has no effect on MVC controllers.
+
+  ```csharp
+  // ✅ Correct for MVC controller applications
+  builder.Services
+      .AddControllers()
+      .AddJsonOptions(options =>
+      {
+          options.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
+          options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
+          options.JsonSerializerOptions.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
+      });
+
+  // ❌ Wrong — only affects minimal APIs, not MVC controllers
+  // builder.Services.ConfigureHttpJsonOptions(...);
+  ```
 
 ---
 
