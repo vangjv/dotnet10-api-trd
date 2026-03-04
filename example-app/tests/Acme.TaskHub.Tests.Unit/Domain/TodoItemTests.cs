@@ -2,6 +2,7 @@ using Acme.TaskHub.Domain.Entities;
 using Acme.TaskHub.Domain.Enums;
 using Acme.TaskHub.Domain.Exceptions;
 using FluentAssertions;
+using Microsoft.Extensions.Time.Testing;
 using Xunit;
 
 namespace Acme.TaskHub.Tests.Unit.Domain;
@@ -11,18 +12,25 @@ namespace Acme.TaskHub.Tests.Unit.Domain;
 /// </summary>
 public class TodoItemTests
 {
+    private static readonly DateTimeOffset FixedNow =
+        new(2025, 6, 1, 10, 0, 0, TimeSpan.Zero);
+
+    // ----- Constructor -----
+
     [Fact]
     public void Constructor_requires_non_empty_id()
     {
         var act = () => new TodoItem(Guid.Empty, "Buy milk");
-        act.Should().Throw<ArgumentException>().WithParameterName("id");
+        act.Should().Throw<DomainValidationException>()
+            .Which.ErrorCode.Should().Be("INVALID_ID");
     }
 
     [Fact]
     public void Constructor_requires_non_empty_title()
     {
         var act = () => new TodoItem(Guid.NewGuid(), "  ");
-        act.Should().Throw<ArgumentException>().WithParameterName("newTitle");
+        act.Should().Throw<DomainValidationException>()
+            .Which.ErrorCode.Should().Be("TITLE_REQUIRED");
     }
 
     [Fact]
@@ -37,32 +45,37 @@ public class TodoItemTests
     {
         string longTitle = new('A', TodoItem.MaxTitleLength + 1);
         var act = () => new TodoItem(Guid.NewGuid(), longTitle);
-        act.Should().Throw<ArgumentException>();
+        act.Should().Throw<DomainValidationException>()
+            .Which.ErrorCode.Should().Be("TITLE_TOO_LONG");
     }
 
     [Fact]
-    public void Constructor_sets_defaults()
+    public void Constructor_sets_defaults_with_exact_time()
     {
-        var item = new TodoItem(Guid.NewGuid(), "Test task");
+        var clock = new FakeTimeProvider(FixedNow);
+        var item = new TodoItem(Guid.NewGuid(), "Test task", timeProvider: clock);
 
         item.Status.Should().Be(TodoStatus.Pending);
         item.Priority.Should().Be(Priority.Medium);
         item.Description.Should().BeNull();
         item.DueDate.Should().BeNull();
         item.CompletedAtUtc.Should().BeNull();
-        item.CreatedAtUtc.Should().BeCloseTo(DateTimeOffset.UtcNow, TimeSpan.FromSeconds(5));
+        item.CreatedAtUtc.Should().Be(FixedNow);
+        item.UpdatedAtUtc.Should().Be(FixedNow);
     }
 
     [Fact]
     public void Constructor_with_all_parameters()
     {
-        var dueDate = DateTimeOffset.UtcNow.AddDays(7);
+        var dueDate = FixedNow.AddDays(7);
+        var clock = new FakeTimeProvider(FixedNow);
         var item = new TodoItem(
             Guid.NewGuid(),
             "Important task",
             "Do this thing",
             Priority.High,
-            dueDate);
+            dueDate,
+            clock);
 
         item.Title.Should().Be("Important task");
         item.Description.Should().Be("Do this thing");
@@ -73,11 +86,14 @@ public class TodoItemTests
     [Fact]
     public void Constructor_rejects_past_due_date()
     {
-        var pastDate = DateTimeOffset.UtcNow.AddDays(-1);
-        var act = () => new TodoItem(Guid.NewGuid(), "Late task", dueDate: pastDate);
-        act.Should().Throw<DomainException>()
+        var clock = new FakeTimeProvider(FixedNow);
+        var pastDate = FixedNow.AddDays(-1);
+        var act = () => new TodoItem(Guid.NewGuid(), "Late task", dueDate: pastDate, timeProvider: clock);
+        act.Should().Throw<DomainValidationException>()
             .Which.ErrorCode.Should().Be("DUE_DATE_IN_PAST");
     }
+
+    // ----- SetTitle -----
 
     [Fact]
     public void SetTitle_updates_title()
@@ -92,8 +108,45 @@ public class TodoItemTests
     {
         var item = new TodoItem(Guid.NewGuid(), "Title");
         var act = () => item.SetTitle("");
-        act.Should().Throw<ArgumentException>();
+        act.Should().Throw<DomainValidationException>()
+            .Which.ErrorCode.Should().Be("TITLE_REQUIRED");
     }
+
+    [Fact]
+    public void SetTitle_updates_UpdatedAtUtc()
+    {
+        var clock = new FakeTimeProvider(FixedNow);
+        var item = new TodoItem(Guid.NewGuid(), "Title", timeProvider: clock);
+
+        clock.Advance(TimeSpan.FromMinutes(5));
+        item.SetTitle("Updated title");
+
+        item.UpdatedAtUtc.Should().Be(FixedNow.AddMinutes(5));
+    }
+
+    [Fact]
+    public void SetTitle_throws_when_item_is_completed()
+    {
+        var item = new TodoItem(Guid.NewGuid(), "Title");
+        item.TransitionTo(TodoStatus.Completed);
+
+        var act = () => item.SetTitle("New title");
+        act.Should().Throw<DomainException>()
+            .Which.ErrorCode.Should().Be("ITEM_NOT_MUTABLE");
+    }
+
+    [Fact]
+    public void SetTitle_throws_when_item_is_cancelled()
+    {
+        var item = new TodoItem(Guid.NewGuid(), "Title");
+        item.TransitionTo(TodoStatus.Cancelled);
+
+        var act = () => item.SetTitle("New title");
+        act.Should().Throw<DomainException>()
+            .Which.ErrorCode.Should().Be("ITEM_NOT_MUTABLE");
+    }
+
+    // ----- SetDescription -----
 
     [Fact]
     public void SetDescription_updates_description()
@@ -125,8 +178,22 @@ public class TodoItemTests
         var item = new TodoItem(Guid.NewGuid(), "Title");
         string longDesc = new('X', TodoItem.MaxDescriptionLength + 1);
         var act = () => item.SetDescription(longDesc);
-        act.Should().Throw<ArgumentException>();
+        act.Should().Throw<DomainValidationException>()
+            .Which.ErrorCode.Should().Be("DESCRIPTION_TOO_LONG");
     }
+
+    [Fact]
+    public void SetDescription_throws_when_item_is_completed()
+    {
+        var item = new TodoItem(Guid.NewGuid(), "Title");
+        item.TransitionTo(TodoStatus.Completed);
+
+        var act = () => item.SetDescription("New desc");
+        act.Should().Throw<DomainException>()
+            .Which.ErrorCode.Should().Be("ITEM_NOT_MUTABLE");
+    }
+
+    // ----- SetPriority -----
 
     [Fact]
     public void SetPriority_updates_priority()
@@ -141,7 +208,60 @@ public class TodoItemTests
     {
         var item = new TodoItem(Guid.NewGuid(), "Title");
         var act = () => item.SetPriority((Priority)99);
-        act.Should().Throw<ArgumentException>();
+        act.Should().Throw<DomainValidationException>()
+            .Which.ErrorCode.Should().Be("INVALID_PRIORITY");
+    }
+
+    [Fact]
+    public void SetPriority_throws_when_item_is_completed()
+    {
+        var item = new TodoItem(Guid.NewGuid(), "Title");
+        item.TransitionTo(TodoStatus.Completed);
+
+        var act = () => item.SetPriority(Priority.Low);
+        act.Should().Throw<DomainException>()
+            .Which.ErrorCode.Should().Be("ITEM_NOT_MUTABLE");
+    }
+
+    // ----- EnsureMutable -----
+
+    [Fact]
+    public void EnsureMutable_does_not_throw_for_pending_item()
+    {
+        var item = new TodoItem(Guid.NewGuid(), "Title");
+        var act = () => item.EnsureMutable();
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void EnsureMutable_does_not_throw_for_inprogress_item()
+    {
+        var item = new TodoItem(Guid.NewGuid(), "Title");
+        item.TransitionTo(TodoStatus.InProgress);
+        var act = () => item.EnsureMutable();
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void EnsureMutable_throws_for_completed_item()
+    {
+        var item = new TodoItem(Guid.NewGuid(), "Title");
+        item.TransitionTo(TodoStatus.Completed);
+
+        var act = () => item.EnsureMutable();
+        act.Should().Throw<DomainException>()
+            .Which.ErrorCode.Should().Be("ITEM_NOT_MUTABLE");
+    }
+
+    [Fact]
+    public void EnsureMutable_throws_for_cancelled_item()
+    {
+        var item = new TodoItem(Guid.NewGuid(), "Title");
+        item.TransitionTo(TodoStatus.Cancelled);
+
+        var act = () => item.EnsureMutable();
+        act.Should().Throw<DomainException>()
+            .Which.ErrorCode.Should().Be("ITEM_NOT_MUTABLE");
     }
 
     // ----- Status transition tests -----
@@ -155,15 +275,20 @@ public class TodoItemTests
     }
 
     [Fact]
-    public void TransitionTo_InProgress_to_Completed_sets_CompletedAtUtc()
+    public void TransitionTo_InProgress_to_Completed_sets_CompletedAtUtc_exactly()
     {
-        var item = new TodoItem(Guid.NewGuid(), "Title");
+        var completedAt = FixedNow.AddHours(2);
+        var clock = new FakeTimeProvider(FixedNow);
+        var item = new TodoItem(Guid.NewGuid(), "Title", timeProvider: clock);
+
         item.TransitionTo(TodoStatus.InProgress);
+
+        clock.SetUtcNow(completedAt);
         item.TransitionTo(TodoStatus.Completed);
 
         item.Status.Should().Be(TodoStatus.Completed);
-        item.CompletedAtUtc.Should().NotBeNull();
-        item.CompletedAtUtc.Should().BeCloseTo(DateTimeOffset.UtcNow, TimeSpan.FromSeconds(5));
+        item.CompletedAtUtc.Should().Be(completedAt);
+        item.UpdatedAtUtc.Should().Be(completedAt);
     }
 
     [Fact]
@@ -234,5 +359,17 @@ public class TodoItemTests
         // Going back to Pending should keep it null.
         item.TransitionTo(TodoStatus.Pending);
         item.CompletedAtUtc.Should().BeNull();
+    }
+
+    [Fact]
+    public void Reopening_cancelled_item_allows_mutation_again()
+    {
+        var item = new TodoItem(Guid.NewGuid(), "Title");
+        item.TransitionTo(TodoStatus.Cancelled);
+
+        // Re-open first, then mutate
+        item.TransitionTo(TodoStatus.Pending);
+        item.SetTitle("New title after reopen");
+        item.Title.Should().Be("New title after reopen");
     }
 }

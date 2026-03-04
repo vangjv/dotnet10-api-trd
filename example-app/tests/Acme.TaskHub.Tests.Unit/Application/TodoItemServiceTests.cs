@@ -3,9 +3,11 @@ using Acme.TaskHub.Application.Models;
 using Acme.TaskHub.Application.Services;
 using Acme.TaskHub.Domain.Entities;
 using Acme.TaskHub.Domain.Enums;
+using Acme.TaskHub.Domain.Exceptions;
 using FluentAssertions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Time.Testing;
 using NSubstitute;
 using Xunit;
 
@@ -16,15 +18,20 @@ namespace Acme.TaskHub.Tests.Unit.Application;
 /// </summary>
 public class TodoItemServiceTests
 {
+    private static readonly DateTimeOffset FixedNow =
+        new(2025, 6, 1, 10, 0, 0, TimeSpan.Zero);
+
     private readonly ITodoItemRepository _repository;
     private readonly ILogger<TodoItemService> _logger;
+    private readonly FakeTimeProvider _clock;
     private readonly TodoItemService _sut;
 
     public TodoItemServiceTests()
     {
         _repository = Substitute.For<ITodoItemRepository>();
         _logger = NullLogger<TodoItemService>.Instance;
-        _sut = new TodoItemService(_repository, _logger);
+        _clock = new FakeTimeProvider(FixedNow);
+        _sut = new TodoItemService(_repository, _logger, _clock);
     }
 
     [Fact]
@@ -45,6 +52,7 @@ public class TodoItemServiceTests
         result.Priority.Should().Be(Priority.High);
         result.Status.Should().Be(TodoStatus.Pending);
         result.Id.Should().NotBeEmpty();
+        result.CreatedAtUtc.Should().Be(FixedNow);
 
         await _repository.Received(1).AddAsync(
             Arg.Is<TodoItem>(x => x.Title == "Write tests"),
@@ -65,7 +73,7 @@ public class TodoItemServiceTests
     [Fact]
     public async Task GetByIdAsync_returns_mapped_item()
     {
-        var item = new TodoItem(Guid.NewGuid(), "Existing");
+        var item = new TodoItem(Guid.NewGuid(), "Existing", timeProvider: _clock);
         _repository.GetByIdAsync(item.Id, Arg.Any<CancellationToken>())
             .Returns(item);
 
@@ -109,7 +117,7 @@ public class TodoItemServiceTests
     [Fact]
     public async Task UpdateAsync_updates_item()
     {
-        var item = new TodoItem(Guid.NewGuid(), "Old Title");
+        var item = new TodoItem(Guid.NewGuid(), "Old Title", timeProvider: _clock);
         _repository.GetByIdAsync(item.Id, Arg.Any<CancellationToken>())
             .Returns(item);
 
@@ -131,9 +139,25 @@ public class TodoItemServiceTests
     }
 
     [Fact]
+    public async Task UpdateAsync_throws_when_item_is_completed()
+    {
+        var item = new TodoItem(Guid.NewGuid(), "Title", timeProvider: _clock);
+        item.TransitionTo(TodoStatus.Completed);
+        _repository.GetByIdAsync(item.Id, Arg.Any<CancellationToken>())
+            .Returns(item);
+
+        var act = async () => await _sut.UpdateAsync(
+            item.Id,
+            new UpdateTodoItemRequest { Title = "Mutate completed" });
+
+        await act.Should().ThrowAsync<DomainException>()
+            .Where(ex => ex.ErrorCode == "ITEM_NOT_MUTABLE");
+    }
+
+    [Fact]
     public async Task UpdateStatusAsync_transitions_status()
     {
-        var item = new TodoItem(Guid.NewGuid(), "Task");
+        var item = new TodoItem(Guid.NewGuid(), "Task", timeProvider: _clock);
         _repository.GetByIdAsync(item.Id, Arg.Any<CancellationToken>())
             .Returns(item);
 

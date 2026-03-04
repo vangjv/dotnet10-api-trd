@@ -28,6 +28,9 @@ public sealed record TodoItemResponse
     /// <summary>Gets the creation timestamp (UTC).</summary>
     public required DateTimeOffset CreatedAtUtc { get; init; }
 
+    /// <summary>Gets the last-modified timestamp (UTC).</summary>
+    public required DateTimeOffset UpdatedAtUtc { get; init; }
+
     /// <summary>Gets the completion timestamp (UTC).</summary>
     public DateTimeOffset? CompletedAtUtc { get; init; }
 }

@@ -14,14 +14,19 @@ public sealed class TodoItemService : ITodoItemService
 {
     private readonly ITodoItemRepository _repository;
     private readonly ILogger<TodoItemService> _logger;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="TodoItemService"/> class.
     /// </summary>
-    public TodoItemService(ITodoItemRepository repository, ILogger<TodoItemService> logger)
+    public TodoItemService(
+        ITodoItemRepository repository,
+        ILogger<TodoItemService> logger,
+        TimeProvider timeProvider)
     {
         _repository = repository;
         _logger = logger;
+        _timeProvider = timeProvider;
     }
 
     /// <inheritdoc />
@@ -34,7 +39,8 @@ public sealed class TodoItemService : ITodoItemService
             request.Title,
             request.Description,
             request.Priority,
-            request.DueDate);
+            request.DueDate,
+            _timeProvider);
 
         await _repository.AddAsync(item, cancellationToken).ConfigureAwait(false);
 
@@ -92,6 +98,7 @@ public sealed class TodoItemService : ITodoItemService
             return null;
         }
 
+        item.EnsureMutable();
         item.SetTitle(request.Title);
         item.SetDescription(request.Description);
         item.SetPriority(request.Priority);

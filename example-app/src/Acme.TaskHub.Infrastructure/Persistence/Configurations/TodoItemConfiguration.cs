@@ -48,11 +48,18 @@ internal sealed class TodoItemConfiguration : IEntityTypeConfiguration<TodoItem>
             .HasConversion(dateTimeOffsetConverter)
             .IsRequired();
 
+        builder.Property(x => x.UpdatedAtUtc)
+            .HasConversion(dateTimeOffsetConverter)
+            .IsRequired();
+
         builder.Property(x => x.DueDate)
             .HasConversion(nullableDateTimeOffsetConverter);
 
         builder.Property(x => x.CompletedAtUtc)
             .HasConversion(nullableDateTimeOffsetConverter);
+
+        // Optimistic concurrency token — prevents lost-update anomalies (TRD §5.5).
+        builder.Property(x => x.RowVersion).IsRowVersion();
 
         // Indexes for common query patterns.
         builder.HasIndex(x => x.Status);

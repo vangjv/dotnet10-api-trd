@@ -286,12 +286,109 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
       public required Priority Priority { get; init; }
   }
   ```
-- **Service interfaces** (`IMyService`) should be co-located with their DTOs/models or placed in `Services/`, and **must not** be in the same folder as `ITodoItemRepository`-style repository interfaces (which live in `Interfaces/`).
+- **Service interfaces** (`IMyService`) should be co-located with their DTOs/models or placed in `Services/`, and **must not** be in the same folder as `ITodoItemRepository`-style repository interfaces (which live in `Interfaces/`). This is an **intentional distinction** — not an inconsistency:
+  ```
+  Application/
+    Interfaces/
+      ITodoItemRepository.cs   ← infrastructure abstraction (implemented in Infrastructure)
+    Services/
+      ITodoItemService.cs      ← application service interface (co-located with implementation)
+      TodoItemService.cs
+  ```
 
 ### 5.5 Domain layer rules
 **Must**
 - Encode invariants; avoid anemic domain.
-- Throw domain exceptions for invariant violations (mapped to 409/422 as appropriate).
+- All mutation must go through **behavioral methods** (`SetTitle`, `TransitionTo`, etc.). Entity properties must use `private set`; never expose public setters on mutable state.
+- Constructors must **validate all preconditions** before assigning state.
+- Throw typed domain exceptions for invariant violations — see §7.2 for the full exception hierarchy.
+
+**State machines**
+- Use an **explicit static `IsValidTransition(from, to)`** helper with a pattern-matching switch expression. Document valid and terminal transitions in XML `<remarks>`. Idempotent transitions (same state → same state) must be no-ops, not errors.
+  ```csharp
+  internal static bool IsValidTransition(MyStatus from, MyStatus to) =>
+      (from, to) switch
+      {
+          (MyStatus.Pending, MyStatus.InProgress) => true,
+          (MyStatus.Completed, _) => false, // terminal
+          _ => false,
+      };
+  ```
+
+**Constants — single source of truth across layers**
+- Define field-length and other limits (`MaxTitleLength`, `MaxDescriptionLength`) as `public const` on the domain entity. Reference them from EF Core `IEntityTypeConfiguration<T>` and FluentValidation validators — **never duplicate literal values**.
+
+**XML documentation**
+- Every public member, constructor parameter, domain event, and interface method must have XML documentation. State machines must document valid transitions in `<remarks>`.
+
+**`TimeProvider` — clock abstraction**
+- **Never call `DateTimeOffset.UtcNow` directly** inside a domain entity. Inject `TimeProvider` to make time-dependent behaviour testable without `BeCloseTo` workarounds.
+- Accept `TimeProvider? timeProvider = null` in the constructor (defaulting to `TimeProvider.System`).
+  ```csharp
+  private readonly TimeProvider _timeProvider;
+
+  public MyEntity(Guid id, string name, TimeProvider? timeProvider = null)
+  {
+      _timeProvider = timeProvider ?? TimeProvider.System;
+      CreatedAtUtc = _timeProvider.GetUtcNow();
+      UpdatedAtUtc = CreatedAtUtc;
+  }
+
+  // ❌ Wrong — couples to wall clock; tests must use BeCloseTo(UtcNow, 5s)
+  // CreatedAtUtc = DateTimeOffset.UtcNow;
+  ```
+- Register `TimeProvider.System` in DI inside the Application `AddApplication()` extension method:
+  ```csharp
+  services.AddSingleton(TimeProvider.System);
+  ```
+- Services that construct domain entities receive `TimeProvider` as a constructor dependency and pass it through.
+- In tests, use `FakeTimeProvider` from the `Microsoft.Extensions.TimeProvider.Testing` package for exact time assertions:
+  ```csharp
+  var clock = new FakeTimeProvider(new DateTimeOffset(2025, 1, 1, 0, 0, 0, TimeSpan.Zero));
+  var entity = new MyEntity(Guid.NewGuid(), "Test", clock);
+  entity.CreatedAtUtc.Should().Be(clock.GetUtcNow()); // exact — no tolerance needed
+  ```
+
+**`UpdatedAtUtc` audit timestamp**
+- All entities that support mutation **must carry an `UpdatedAtUtc` property** for audit trails and cache-invalidation support. Set it equal to `CreatedAtUtc` in the constructor; update it in every mutating method via a private `Touch()` helper:
+  ```csharp
+  public DateTimeOffset UpdatedAtUtc { get; private set; }
+
+  private void Touch() => UpdatedAtUtc = _timeProvider.GetUtcNow();
+  ```
+
+**`EnsureMutable()` guard**
+- Entities with terminal states (Completed, Cancelled, etc.) **must expose a public `EnsureMutable()` method** that throws `DomainException` when the entity can no longer be mutated. Call it at the top of every behavioral method that modifies non-status state:
+  ```csharp
+  /// <summary>Throws if the item is in a terminal state and cannot be mutated.</summary>
+  /// <exception cref="DomainException">Thrown with code <c>ITEM_NOT_MUTABLE</c>.</exception>
+  public void EnsureMutable()
+  {
+      if (Status is MyStatus.Completed or MyStatus.Cancelled)
+          throw new DomainException(
+              "ITEM_NOT_MUTABLE",
+              $"Cannot modify an item in '{Status}' status. Re-open it first.");
+  }
+
+  public void SetTitle(string newTitle)
+  {
+      EnsureMutable(); // guard first
+      // ... validation and assignment
+      Touch();
+  }
+  ```
+
+**Optimistic concurrency control**
+- Entities that can be mutated concurrently **must carry a `RowVersion` concurrency token** to prevent lost-update anomalies (e.g. two clients both reading `Pending` and both transitioning it simultaneously).
+- Declare the property on the domain entity; configure it in EF Core:
+  ```csharp
+  // Domain entity
+  public byte[]? RowVersion { get; private set; }
+
+  // IEntityTypeConfiguration<T>
+  builder.Property(x => x.RowVersion).IsRowVersion();
+  ```
+- Services should catch `DbUpdateConcurrencyException` and translate it to HTTP 409 Conflict.
 
 ### 5.6 Infrastructure layer rules
 **Must**
@@ -376,6 +473,48 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
 **Must**
 - Single middleware/filter translates exceptions to Problem Details.
 - Never leak stack traces or secrets to clients.
+- Map domain exceptions using a **two-level hierarchy** (subclass must be checked first):
+
+  | Exception type | HTTP status | Use for |
+  |---|---|---|
+  | `DomainValidationException` (subclass) | 422 Unprocessable Entity | Input violated a domain validation constraint (field length, format, due-date in the past) |
+  | `DomainException` (base) | 409 Conflict | Business/lifecycle rule violated (invalid state transition, item not mutable) |
+
+  ```csharp
+  // ✅ DomainValidationException — field/format constraint → 422
+  throw new DomainValidationException("TITLE_TOO_LONG",
+      $"Title must not exceed {MaxTitleLength} characters.");
+
+  // ✅ DomainException — business/lifecycle rule → 409
+  throw new DomainException("INVALID_STATUS_TRANSITION",
+      $"Cannot transition from '{from}' to '{to}'.");
+  ```
+
+  Exception handler (evaluate subclass **before** base class):
+  ```csharp
+  if (exception is DomainValidationException validationEx)
+  {
+      problem = new ProblemDetails
+      {
+          Title = "A domain validation rule was violated.",
+          Status = StatusCodes.Status422UnprocessableEntity,
+          Detail = validationEx.Message,
+      };
+      problem.Extensions["errorCode"] = validationEx.ErrorCode;
+  }
+  else if (exception is DomainException domainEx)
+  {
+      problem = new ProblemDetails
+      {
+          Title = "A domain rule was violated.",
+          Status = StatusCodes.Status409Conflict,
+          Detail = domainEx.Message,
+      };
+      problem.Extensions["errorCode"] = domainEx.ErrorCode;
+  }
+  ```
+
+  > ⚠️ **Never** use `ArgumentException` for domain validation — it carries no `ErrorCode` and the global handler maps it to 500. Always use `DomainValidationException` instead.
 
 ### 7.3 Input validation
 **Must**

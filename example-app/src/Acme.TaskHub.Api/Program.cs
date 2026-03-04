@@ -167,7 +167,17 @@ app.UseExceptionHandler(exceptionApp =>
 
         ProblemDetails problem;
 
-        if (exception is DomainException domainEx)
+        if (exception is DomainValidationException domainValidationEx)
+        {
+            problem = new ProblemDetails
+            {
+                Title = "A domain validation rule was violated.",
+                Status = StatusCodes.Status422UnprocessableEntity,
+                Detail = domainValidationEx.Message,
+            };
+            problem.Extensions["errorCode"] = domainValidationEx.ErrorCode;
+        }
+        else if (exception is DomainException domainEx)
         {
             problem = new ProblemDetails
             {

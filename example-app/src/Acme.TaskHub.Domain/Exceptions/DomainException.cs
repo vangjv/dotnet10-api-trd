@@ -1,10 +1,12 @@
 namespace Acme.TaskHub.Domain.Exceptions;
 
 /// <summary>
-/// Thrown when a domain invariant is violated.
-/// Mapped to HTTP 409/422 by the global exception handler.
+/// Thrown when a domain business rule or lifecycle rule is violated.
+/// Mapped to HTTP 409 Conflict by the global exception handler.
+/// Use the <see cref="DomainValidationException"/> subclass for field-level
+/// validation violations, which map to HTTP 422 Unprocessable Entity.
 /// </summary>
-public sealed class DomainException : Exception
+public class DomainException : Exception
 {
     /// <summary>
     /// Initializes a new instance of the <see cref="DomainException"/> class.

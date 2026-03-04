@@ -22,6 +22,7 @@ public static class TodoItemMappingExtensions
             Status = entity.Status,
             DueDate = entity.DueDate,
             CreatedAtUtc = entity.CreatedAtUtc,
+            UpdatedAtUtc = entity.UpdatedAtUtc,
             CompletedAtUtc = entity.CompletedAtUtc,
         };
     }
