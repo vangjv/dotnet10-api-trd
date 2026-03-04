@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using Acme.TaskHub.Api.Auth;
 using Acme.TaskHub.Application;
+using Acme.TaskHub.Application.Instrumentation;
 using Acme.TaskHub.Domain.Exceptions;
 using Acme.TaskHub.Infrastructure;
 using Azure.Monitor.OpenTelemetry.Exporter;
@@ -12,15 +13,21 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Identity.Web;
 using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using Serilog;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // ----- Logging (Serilog) -----
+// TRD §9.1: Enrich every log event with static application identity so logs from different
+// services are distinguishable in Azure Monitor / Log Analytics. WithProperty must be
+// configured here in code — it cannot be specified in appsettings.json enricher arrays.
 builder.Host.UseSerilog((ctx, cfg) =>
 {
-    cfg.ReadFrom.Configuration(ctx.Configuration);
+    cfg.ReadFrom.Configuration(ctx.Configuration)
+       .Enrich.WithProperty("Application", "Acme.TaskHub.Api")
+       .Enrich.WithProperty("Environment", ctx.HostingEnvironment.EnvironmentName);
 });
 
 // ----- Controllers + API Behavior -----
@@ -164,7 +171,18 @@ builder.Services.AddHttpClient("Downstream")
     });
 
 // ----- OpenTelemetry -----
+// TRD §9.3: ConfigureResource sets service.name, service.version, and deployment.environment
+// so traces and metrics in Azure Monitor are identifiable per service/deployment.
+// Without this, telemetry appears as an unnamed service in all environments.
 var otelBuilder = builder.Services.AddOpenTelemetry()
+    .ConfigureResource(resource => resource
+        .AddService(
+            serviceName: "Acme.TaskHub.Api",
+            serviceVersion: typeof(Program).Assembly.GetName().Version?.ToString() ?? "0.0.0")
+        .AddAttributes(new Dictionary<string, object>
+        {
+            ["deployment.environment"] = builder.Environment.EnvironmentName,
+        }))
     .WithTracing(tracing =>
     {
         tracing.AddAspNetCoreInstrumentation();
@@ -185,6 +203,10 @@ var otelBuilder = builder.Services.AddOpenTelemetry()
     {
         metrics.AddAspNetCoreInstrumentation();
         metrics.AddHttpClientInstrumentation();
+
+        // TRD §9.2: Register the application business-metrics meter so the OTel SDK
+        // collects and exports it. The meter is populated by TodoItemMetrics.
+        metrics.AddMeter(TodoItemMetrics.MeterName);
 
         if (!builder.Environment.IsDevelopment())
         {
@@ -208,6 +230,26 @@ app.Use(async (context, next) =>
     context.Response.Headers.Append("X-Frame-Options", "DENY");
     context.Response.Headers.Append("Cache-Control", "no-store");
     await next(context);
+});
+
+// Correlation ID enrichment (TRD §9.1) — reads or generates an X-Correlation-ID header,
+// echoes it back to the caller, and pushes it into the Serilog log context so every
+// log event in the request scope is tagged with the same correlation ID.
+app.Use(async (context, next) =>
+{
+    const string headerName = "X-Correlation-ID";
+    if (!context.Request.Headers.TryGetValue(headerName, out var correlationId)
+        || string.IsNullOrWhiteSpace(correlationId))
+    {
+        correlationId = Guid.NewGuid().ToString();
+    }
+
+    context.Response.Headers.Append(headerName, correlationId.ToString());
+
+    using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId.ToString()))
+    {
+        await next(context);
+    }
 });
 
 app.UseSerilogRequestLogging();

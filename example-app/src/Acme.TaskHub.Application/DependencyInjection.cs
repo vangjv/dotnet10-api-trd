@@ -1,3 +1,4 @@
+using Acme.TaskHub.Application.Instrumentation;
 using Acme.TaskHub.Application.Services;
 using FluentValidation;
 using Microsoft.Extensions.DependencyInjection;
@@ -19,6 +20,10 @@ public static class DependencyInjection
         services.AddSingleton(TimeProvider.System);
 
         services.AddScoped<ITodoItemService, TodoItemService>();
+
+        // Business KPI metrics (TRD §9.2). Singleton because Meter/Counter are thread-safe
+        // and should be shared for the lifetime of the application.
+        services.AddSingleton<ITodoItemMetrics, TodoItemMetrics>();
 
         // Register all FluentValidation validators from this assembly.
         services.AddValidatorsFromAssemblyContaining<TodoItemService>();

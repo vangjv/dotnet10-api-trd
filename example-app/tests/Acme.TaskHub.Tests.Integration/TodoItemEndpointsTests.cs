@@ -4,7 +4,9 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Acme.TaskHub.Application.Models;
 using Acme.TaskHub.Domain.Enums;
+using Acme.TaskHub.Infrastructure.Persistence;
 using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace Acme.TaskHub.Tests.Integration;
@@ -12,7 +14,13 @@ namespace Acme.TaskHub.Tests.Integration;
 /// <summary>
 /// Integration tests for the /v1/todoitems endpoints — full CRUD lifecycle.
 /// </summary>
-public class TodoItemEndpointsTests : IClassFixture<CustomWebApplicationFactory>
+/// <remarks>
+/// Implements <see cref="IAsyncLifetime"/> so <see cref="InitializeAsync"/> truncates the
+/// TodoItems table before each test (TRD §13.3). xUnit creates a new class instance per test,
+/// so <see cref="InitializeAsync"/> effectively runs per test, giving clean isolated state
+/// without requiring a separate factory per test.
+/// </remarks>
+public class TodoItemEndpointsTests : IClassFixture<CustomWebApplicationFactory>, IAsyncLifetime
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -20,10 +28,26 @@ public class TodoItemEndpointsTests : IClassFixture<CustomWebApplicationFactory>
         Converters = { new JsonStringEnumConverter() },
     };
 
+    private readonly CustomWebApplicationFactory _factory;
     private readonly HttpClient _client;
 
-    public TodoItemEndpointsTests(CustomWebApplicationFactory factory) =>
+    public TodoItemEndpointsTests(CustomWebApplicationFactory factory)
+    {
+        _factory = factory;
         _client = factory.CreateClient();
+    }
+
+    /// <summary>Truncates the TodoItems table before each test for isolation (TRD §13.3).</summary>
+    public async Task InitializeAsync()
+    {
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        db.TodoItems.RemoveRange(db.TodoItems);
+        await db.SaveChangesAsync();
+    }
+
+    /// <inheritdoc />
+    public Task DisposeAsync() => Task.CompletedTask;
 
     [Fact]
     public async Task Create_returns_201_and_body()
@@ -74,6 +98,7 @@ public class TodoItemEndpointsTests : IClassFixture<CustomWebApplicationFactory>
     [Fact]
     public async Task GetAll_returns_paged_result()
     {
+        // Table is empty before this test (InitializeAsync) so counts are exact.
         await CreateItemAsync("Paged item 1");
         await CreateItemAsync("Paged item 2");
 
@@ -82,8 +107,8 @@ public class TodoItemEndpointsTests : IClassFixture<CustomWebApplicationFactory>
         response.StatusCode.Should().Be(HttpStatusCode.OK);
         var body = await response.Content.ReadFromJsonAsync<PagedResult<TodoItemResponse>>(JsonOptions);
         body.Should().NotBeNull();
-        body!.Items.Should().HaveCountGreaterThanOrEqualTo(2);
-        body.TotalCount.Should().BeGreaterThanOrEqualTo(2);
+        body!.Items.Should().HaveCount(2);
+        body.TotalCount.Should().Be(2);
     }
 
     [Fact]
@@ -101,7 +126,7 @@ public class TodoItemEndpointsTests : IClassFixture<CustomWebApplicationFactory>
         response.StatusCode.Should().Be(HttpStatusCode.OK);
 
         var body = await response.Content.ReadFromJsonAsync<PagedResult<TodoItemResponse>>(JsonOptions);
-        body!.Items.Should().Contain(x => x.Id == created.Id);
+        body!.Items.Should().ContainSingle(x => x.Id == created.Id);
     }
 
     [Fact]

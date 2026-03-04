@@ -11,7 +11,7 @@ namespace Acme.TaskHub.Tests.Integration;
 /// Custom <see cref="WebApplicationFactory{TEntryPoint}"/> that replaces the SQLite database
 /// with a unique in-memory database per test class to ensure isolation.
 /// </summary>
-public sealed class CustomWebApplicationFactory : WebApplicationFactory<Program>
+public class CustomWebApplicationFactory : WebApplicationFactory<Program>
 {
     /// <summary>
     /// Persistent connection that keeps the in-memory SQLite database alive
@@ -50,10 +50,9 @@ public sealed class CustomWebApplicationFactory : WebApplicationFactory<Program>
                 options.UseSqlite(connectionString);
             });
 
-            // Ensure the database schema is created.
-            using var scope = services.BuildServiceProvider().CreateScope();
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            db.Database.EnsureCreated();
+            // Schema is created by MigrateAsync in InitializeDatabaseAsync during
+            // application startup (DependencyInjection.cs). Do NOT call EnsureCreated
+            // here — it conflicts with MigrateAsync when the app runs in Development.
         });
     }
 

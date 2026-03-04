@@ -1,3 +1,4 @@
+using Acme.TaskHub.Application.Instrumentation;
 using Acme.TaskHub.Application.Interfaces;
 using Acme.TaskHub.Application.Models;
 using Acme.TaskHub.Application.Services;
@@ -24,6 +25,7 @@ public class TodoItemServiceTests
     private readonly ITodoItemRepository _repository;
     private readonly ILogger<TodoItemService> _logger;
     private readonly FakeTimeProvider _clock;
+    private readonly ITodoItemMetrics _metrics;
     private readonly TodoItemService _sut;
 
     public TodoItemServiceTests()
@@ -31,7 +33,8 @@ public class TodoItemServiceTests
         _repository = Substitute.For<ITodoItemRepository>();
         _logger = NullLogger<TodoItemService>.Instance;
         _clock = new FakeTimeProvider(FixedNow);
-        _sut = new TodoItemService(_repository, _logger, _clock);
+        _metrics = Substitute.For<ITodoItemMetrics>();
+        _sut = new TodoItemService(_repository, _logger, _clock, _metrics);
     }
 
     [Fact]

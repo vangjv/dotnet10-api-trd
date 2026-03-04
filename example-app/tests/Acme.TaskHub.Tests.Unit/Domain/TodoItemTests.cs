@@ -223,6 +223,98 @@ public class TodoItemTests
             .Which.ErrorCode.Should().Be("ITEM_NOT_MUTABLE");
     }
 
+    // ----- SetDueDate -----
+
+    [Fact]
+    public void SetDueDate_sets_future_date()
+    {
+        var clock = new FakeTimeProvider(FixedNow);
+        var item = new TodoItem(Guid.NewGuid(), "Title", timeProvider: clock);
+        var futureDate = FixedNow.AddDays(3);
+
+        item.SetDueDate(futureDate);
+
+        item.DueDate.Should().Be(futureDate);
+    }
+
+    [Fact]
+    public void SetDueDate_clears_with_null()
+    {
+        var clock = new FakeTimeProvider(FixedNow);
+        var item = new TodoItem(
+            Guid.NewGuid(),
+            "Title",
+            dueDate: FixedNow.AddDays(7),
+            timeProvider: clock);
+
+        item.SetDueDate(null);
+
+        item.DueDate.Should().BeNull();
+    }
+
+    [Fact]
+    public void SetDueDate_rejects_past_date()
+    {
+        var clock = new FakeTimeProvider(FixedNow);
+        var item = new TodoItem(Guid.NewGuid(), "Title", timeProvider: clock);
+
+        var act = () => item.SetDueDate(FixedNow.AddDays(-1));
+
+        act.Should().Throw<DomainValidationException>()
+            .Which.ErrorCode.Should().Be("DUE_DATE_IN_PAST");
+    }
+
+    [Fact]
+    public void SetDueDate_rejects_date_equal_to_current_time()
+    {
+        // Due date must be strictly in the future (> now, not >= now).
+        var clock = new FakeTimeProvider(FixedNow);
+        var item = new TodoItem(Guid.NewGuid(), "Title", timeProvider: clock);
+
+        var act = () => item.SetDueDate(FixedNow);
+
+        act.Should().Throw<DomainValidationException>()
+            .Which.ErrorCode.Should().Be("DUE_DATE_IN_PAST");
+    }
+
+    [Fact]
+    public void SetDueDate_updates_UpdatedAtUtc()
+    {
+        var clock = new FakeTimeProvider(FixedNow);
+        var item = new TodoItem(Guid.NewGuid(), "Title", timeProvider: clock);
+
+        clock.Advance(TimeSpan.FromMinutes(5));
+        item.SetDueDate(FixedNow.AddDays(3));
+
+        item.UpdatedAtUtc.Should().Be(FixedNow.AddMinutes(5));
+    }
+
+    [Fact]
+    public void SetDueDate_throws_when_item_is_completed()
+    {
+        var clock = new FakeTimeProvider(FixedNow);
+        var item = new TodoItem(Guid.NewGuid(), "Title", timeProvider: clock);
+        item.TransitionTo(TodoStatus.Completed);
+
+        var act = () => item.SetDueDate(FixedNow.AddDays(3));
+
+        act.Should().Throw<DomainException>()
+            .Which.ErrorCode.Should().Be("ITEM_NOT_MUTABLE");
+    }
+
+    [Fact]
+    public void SetDueDate_throws_when_item_is_cancelled()
+    {
+        var clock = new FakeTimeProvider(FixedNow);
+        var item = new TodoItem(Guid.NewGuid(), "Title", timeProvider: clock);
+        item.TransitionTo(TodoStatus.Cancelled);
+
+        var act = () => item.SetDueDate(FixedNow.AddDays(3));
+
+        act.Should().Throw<DomainException>()
+            .Which.ErrorCode.Should().Be("ITEM_NOT_MUTABLE");
+    }
+
     // ----- EnsureMutable -----
 
     [Fact]

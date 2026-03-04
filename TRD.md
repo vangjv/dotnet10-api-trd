@@ -2,7 +2,7 @@
 ## Enterprise-grade C#/.NET 10 API Backend (Azure AD + EF Core + Azure Container Apps)
 
 **Document owner:** Engineering Platform  
-**Last updated:** 2026-03-01  
+**Last updated:** 2026-03-04  
 **Target runtime:** .NET 10 (LTS/enterprise standard)  
 **Primary hosting:** Azure Container Apps (ACA)  
 **Auth standard:** Microsoft Entra ID (Azure AD)  
@@ -710,16 +710,121 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
   - `traceId`, `spanId`, `requestId`
   - `route`, `statusCode`, `durationMs`
   - `tenantId`/`clientId` (non-PII where possible)
+- **Enrich every log event with static application identity.** Call `.Enrich.WithProperty("Application", "<ServiceName>")` and `.Enrich.WithProperty("Environment", EnvironmentName)` on the `LoggerConfiguration`. This is the minimum required for multi-service log aggregation — without it, logs from different services are indistinguishable in Azure Monitor / Log Analytics.
+  ```csharp
+  builder.Host.UseSerilog((ctx, cfg) =>
+  {
+      cfg.ReadFrom.Configuration(ctx.Configuration)
+         .Enrich.WithProperty("Application", "Company.Product.Service.Api")
+         .Enrich.WithProperty("Environment", ctx.HostingEnvironment.EnvironmentName);
+  });
+  ```
+- **Enrich per-request log events with a correlation ID.** Read or generate an `X-Correlation-ID` header per request and push it into the Serilog log context using `LogContext.PushProperty`. Echo the ID back to the caller in the response header:
+  ```csharp
+  // Early in pipeline — before UseSerilogRequestLogging
+  app.Use(async (context, next) =>
+  {
+      const string header = "X-Correlation-ID";
+      if (!context.Request.Headers.TryGetValue(header, out var correlationId)
+          || string.IsNullOrWhiteSpace(correlationId))
+      {
+          correlationId = Guid.NewGuid().ToString();
+      }
+      context.Response.Headers.Append(header, correlationId.ToString());
+      using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId.ToString()))
+      {
+          await next(context);
+      }
+  });
+  ```
+  > ⚠️ Registering `FromLogContext` in `appsettings.json` is **not sufficient** — `WithProperty` static enrichers must be configured in code via `UseSerilog`. `FromLogContext` only carries ambient pushed properties (like `CorrelationId`); it does not add static properties automatically.
 
 ### 9.2 Metrics
 **Must**
 - Publish RED metrics per endpoint.
 - Track EF Core query durations and connection pool usage.
+- **Publish custom business KPI metrics** using `System.Diagnostics.Metrics.Meter` (BCL — no external package needed). Define a metrics class with named counters for key business events and register it as a singleton via the Application layer's `AddApplication()` method:
+  ```csharp
+  // Application/Instrumentation/ServiceNameMetrics.cs
+  public interface IMyServiceMetrics
+  {
+      void RecordCreated();
+      void RecordStatusTransition(string toStatus);
+      void RecordDeleted();
+  }
+
+  public sealed class MyServiceMetrics : IMyServiceMetrics
+  {
+      public const string MeterName = "Company.Product.Service";
+
+      private readonly Counter<long> _created;
+      private readonly Counter<long> _statusTransitions;
+      private readonly Counter<long> _deleted;
+
+      public MyServiceMetrics(IMeterFactory meterFactory)
+      {
+          var meter = meterFactory.Create(MeterName);
+          _created = meter.CreateCounter<long>(
+              "items.created",
+              description: "Number of items created.");
+          _statusTransitions = meter.CreateCounter<long>(
+              "items.status_transitions",
+              description: "Number of status transitions.");
+          _deleted = meter.CreateCounter<long>(
+              "items.deleted",
+              description: "Number of items deleted.");
+      }
+
+      public void RecordCreated() => _created.Add(1);
+      public void RecordStatusTransition(string toStatus) =>
+          _statusTransitions.Add(1, new KeyValuePair<string, object?>("to_status", toStatus));
+      public void RecordDeleted() => _deleted.Add(1);
+  }
+  ```
+  Register in `DependencyInjection.cs`:
+  ```csharp
+  services.AddSingleton<IMyServiceMetrics, MyServiceMetrics>();
+  ```
+  Register the meter in OpenTelemetry setup (Api layer `Program.cs`):
+  ```csharp
+  .WithMetrics(metrics =>
+  {
+      metrics.AddAspNetCoreInstrumentation();
+      metrics.AddHttpClientInstrumentation();
+      metrics.AddMeter(MyServiceMetrics.MeterName); // ← business metrics
+      ...
+  })
+  ```
+  Inject `IMyServiceMetrics` into the application service (not controllers) and record events at the service boundary:
+  ```csharp
+  public async Task<MyResponse> CreateAsync(...)
+  {
+      // ... create entity ...
+      _metrics.RecordCreated();
+      return entity.ToResponse();
+  }
+  ```
+  > ⚠️ Relying only on framework-provided instrumentation (e.g., ASP.NET Core request counters) gives no visibility into business-level KPIs. Custom meters are essential for SLI dashboards and alerting on domain events.
 
 ### 9.3 Tracing
 **Must**
 - Propagate W3C trace context.
 - Trace inbound requests and outbound HTTP/SQL dependencies.
+- **Configure OpenTelemetry service resource attributes.** Without `service.name`, `service.version`, and `deployment.environment`, traces and metrics in Azure Monitor cannot be correlated to a specific service or deployment. Call `ConfigureResource` on the OpenTelemetry builder before `WithTracing`/`WithMetrics`:
+  ```csharp
+  builder.Services.AddOpenTelemetry()
+      .ConfigureResource(resource => resource
+          .AddService(
+              serviceName: "Company.Product.Service.Api",
+              serviceVersion: typeof(Program).Assembly.GetName().Version?.ToString() ?? "0.0.0")
+          .AddAttributes(new Dictionary<string, object>
+          {
+              ["deployment.environment"] = builder.Environment.EnvironmentName,
+          }))
+      .WithTracing(...)
+      .WithMetrics(...);
+  ```
+  > ⚠️ Omitting `ConfigureResource` is one of the most common observability oversights. Without it, all telemetry flows to Azure Monitor as an unnamed service version `0.0.0` in an undefined environment, making alert routing and dashboards inaccurate.
 
 ### 9.4 Alerting (minimum)
 **Must**
@@ -910,10 +1015,118 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
 - Overall solution: **≥ 60% line coverage**
 (Adjust per org maturity; do not game coverage.)
 
-### 13.3 Release
+### 13.3 Testing patterns
+
+**FluentValidation validator unit tests**
+- Every validator with non-trivial rules (conditional `.When()` clauses, length limits, enum validation, date comparisons) **must have dedicated unit tests** covering:
+  - Valid input passes
+  - Boundary values (exactly at limit, one over the limit)
+  - Each validation rule independently
+  - Conditional rules: rule fires when condition is met AND is skipped when condition is not met
+- Instantiate the validator directly in tests — no DI required:
+  ```csharp
+  [Fact]
+  public async Task Title_at_max_length_boundary_passes()
+  {
+      var sut = new CreateMyRequestValidator();
+      var request = new CreateMyRequest { Title = new string('X', MyEntity.MaxTitleLength) };
+      var result = await sut.ValidateAsync(request);
+      result.IsValid.Should().BeTrue();
+  }
+  ```
+
+**Time-relative validator rules**
+- **Never use `GreaterThan(DateTimeOffset.UtcNow)`** in a FluentValidation rule — `GreaterThan` evaluates its argument once at validator construction time (when the DI container builds the validator). If the validator is registered as scoped or singleton, the captured timestamp becomes stale immediately.
+- **Always use `.Must()` with a lambda** so the comparison is evaluated fresh at validation time:
+  ```csharp
+  // ✅ Correct — evaluated at validation time
+  RuleFor(x => x.DueDate)
+      .Must(d => d > DateTimeOffset.UtcNow)
+      .WithMessage("Due date must be in the future.")
+      .When(x => x.DueDate.HasValue);
+
+  // ❌ Wrong — DateTimeOffset.UtcNow captured once at validator construction
+  // RuleFor(x => x.DueDate)
+  //     .GreaterThan(DateTimeOffset.UtcNow)
+  //     .When(x => x.DueDate.HasValue);
+  ```
+
+**Integration test database isolation**
+- Shared `WebApplicationFactory` + shared in-memory SQLite means tests see each other's data. Use `IAsyncLifetime` to truncate the relevant tables before each test (xUnit creates a new test class instance per test, so `InitializeAsync` runs once per test):
+  ```csharp
+  public class MyEndpointsTests : IClassFixture<CustomWebApplicationFactory>, IAsyncLifetime
+  {
+      private readonly CustomWebApplicationFactory _factory;
+      private readonly HttpClient _client;
+
+      public MyEndpointsTests(CustomWebApplicationFactory factory)
+      {
+          _factory = factory;
+          _client = factory.CreateClient();
+      }
+
+      public async Task InitializeAsync()
+      {
+          using var scope = _factory.Services.CreateScope();
+          var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+          db.MyEntities.RemoveRange(db.MyEntities);
+          await db.SaveChangesAsync();
+      }
+
+      public Task DisposeAsync() => Task.CompletedTask;
+  }
+  ```
+- With per-test cleanup, use **exact count assertions** (`HaveCount(2)`, `.Be(2)`) rather than defensive `HaveCountGreaterThanOrEqualTo` which masks ordering and state-pollution bugs.
+
+**Authorization policy tests**
+- `DevAuthHandler` auto-succeeds in Development, so authorization policies are never challenged during normal integration tests. Provide a second `WebApplicationFactory` that replaces the auth handler with one that always fails, then verify unauthenticated requests receive **401 Unauthorized**:
+  ```csharp
+  internal sealed class UnauthenticatedWebApplicationFactory : CustomWebApplicationFactory
+  {
+      protected override void ConfigureWebHost(IWebHostBuilder builder)
+      {
+          base.ConfigureWebHost(builder); // applies DB override
+          builder.ConfigureTestServices(services =>
+          {
+              services
+                  .AddAuthentication("RejectAll")
+                  .AddScheme<AuthenticationSchemeOptions, RejectAllAuthHandler>("RejectAll", _ => { });
+          });
+      }
+
+      private sealed class RejectAllAuthHandler : AuthenticationHandler<AuthenticationSchemeOptions>
+      {
+          public RejectAllAuthHandler(
+              IOptionsMonitor<AuthenticationSchemeOptions> options,
+              ILoggerFactory logger, UrlEncoder encoder) : base(options, logger, encoder) { }
+
+          protected override Task<AuthenticateResult> HandleAuthenticateAsync()
+              => Task.FromResult(AuthenticateResult.Fail("No credentials provided."));
+      }
+  }
+  ```
+  Use `IClassFixture<UnauthenticatedWebApplicationFactory>` in a dedicated `AuthorizationTests` class that confirms every protected endpoint returns 401 without credentials.
+
+**Health check predicate pattern**
+- Liveness should pass `Predicate = _ => false` so it **never** runs dependency checks. Running DB or downstream checks in liveness causes cascading container restarts when a downstream service is slow — not a signal that the process itself is unhealthy.
+- Readiness should target named checks by name (e.g., `check.Name == "database"`) so new checks don't accidentally leak into liveness:
+  ```csharp
+  app.MapHealthChecks("/health/live", new HealthCheckOptions
+  {
+      Predicate = _ => false, // ← no dependency checks; process health only
+  });
+  app.MapHealthChecks("/health/ready", new HealthCheckOptions
+  {
+      Predicate = check => check.Name == "database",
+  });
+  ```
+
+### 13.4 Release
 **Must**
 - Semantic versioning.
 - Immutable artifacts; build once, deploy many.
+
+---
 
 ---
 
@@ -921,7 +1134,7 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
 
 ### 14.1 Health checks
 **Must**
-- `/health/live` checks process health only.
+- `/health/live` checks process health only — use `Predicate = _ => false` so no dependency health checks run on the liveness path (see §13.3 for the correct predicate pattern).
 - `/health/ready` checks critical dependencies (Azure SQL connectivity, Key Vault access if required).
 
 ### 14.2 Runbooks

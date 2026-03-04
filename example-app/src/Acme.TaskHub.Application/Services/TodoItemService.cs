@@ -1,3 +1,4 @@
+using Acme.TaskHub.Application.Instrumentation;
 using Acme.TaskHub.Application.Interfaces;
 using Acme.TaskHub.Application.Mapping;
 using Acme.TaskHub.Application.Models;
@@ -15,6 +16,7 @@ public sealed class TodoItemService : ITodoItemService
     private readonly ITodoItemRepository _repository;
     private readonly ILogger<TodoItemService> _logger;
     private readonly TimeProvider _timeProvider;
+    private readonly ITodoItemMetrics _metrics;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="TodoItemService"/> class.
@@ -22,11 +24,13 @@ public sealed class TodoItemService : ITodoItemService
     public TodoItemService(
         ITodoItemRepository repository,
         ILogger<TodoItemService> logger,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        ITodoItemMetrics metrics)
     {
         _repository = repository;
         _logger = logger;
         _timeProvider = timeProvider;
+        _metrics = metrics;
     }
 
     /// <inheritdoc />
@@ -48,6 +52,8 @@ public sealed class TodoItemService : ITodoItemService
             "Created TodoItem {TodoItemId} with title '{Title}'",
             item.Id,
             item.Title);
+
+        _metrics.RecordCreated();
 
         return item.ToResponse();
     }
@@ -132,6 +138,8 @@ public sealed class TodoItemService : ITodoItemService
             item.Id,
             request.Status);
 
+        _metrics.RecordStatusTransition(request.Status.ToString());
+
         return item.ToResponse();
     }
 
@@ -145,6 +153,7 @@ public sealed class TodoItemService : ITodoItemService
         if (deleted)
         {
             _logger.LogInformation("Deleted TodoItem {TodoItemId}", id);
+            _metrics.RecordDeleted();
         }
 
         return deleted;
