@@ -5,6 +5,7 @@ using Asp.Versioning;
 using FluentValidation;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 
 namespace Acme.TaskHub.Api.Controllers.V1;
 
@@ -100,6 +101,8 @@ public sealed class TodoItemsController : ControllerBase
     /// <response code="400">Validation failed.</response>
     [HttpPost]
     [Authorize(Policy = "Api.Write")]
+    [Consumes("application/json")] // TRD §6.3
+    [EnableRateLimiting("ApiWrite")] // TRD §8.5
     [ProducesResponseType(typeof(TodoItemResponse), StatusCodes.Status201Created)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> Create(
@@ -128,6 +131,8 @@ public sealed class TodoItemsController : ControllerBase
     /// <response code="404">Item not found.</response>
     [HttpPut("{id:guid}")]
     [Authorize(Policy = "Api.Write")]
+    [Consumes("application/json")] // TRD §6.3
+    [EnableRateLimiting("ApiWrite")] // TRD §8.5
     [ProducesResponseType(typeof(TodoItemResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
@@ -164,6 +169,8 @@ public sealed class TodoItemsController : ControllerBase
     /// <response code="409">Invalid status transition.</response>
     [HttpPatch("{id:guid}/status")]
     [Authorize(Policy = "Api.Write")]
+    [Consumes("application/json")] // TRD §6.3
+    [EnableRateLimiting("ApiWrite")] // TRD §8.5
     [ProducesResponseType(typeof(TodoItemResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
@@ -198,6 +205,7 @@ public sealed class TodoItemsController : ControllerBase
     /// <response code="404">Item not found.</response>
     [HttpDelete("{id:guid}")]
     [Authorize(Policy = "Api.Write")]
+    [EnableRateLimiting("ApiWrite")] // TRD §8.5
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> Delete(Guid id, CancellationToken cancellationToken)

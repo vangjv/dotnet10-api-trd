@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading.RateLimiting;
 using Acme.TaskHub.Api.Auth;
 using Acme.TaskHub.Application;
 using Acme.TaskHub.Domain.Exceptions;
@@ -8,6 +9,7 @@ using Acme.TaskHub.Infrastructure;
 using Azure.Monitor.OpenTelemetry.Exporter;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Identity.Web;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Trace;
@@ -44,6 +46,34 @@ builder.Services
             return new BadRequestObjectResult(problem);
         };
     });
+
+// ----- Rate Limiting (TRD §8.5) -----
+// Fixed-window policy for write operations — 60 requests / user / minute.
+// Built into ASP.NET Core 7+ (Microsoft.AspNetCore.RateLimiting); no extra NuGet needed.
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddFixedWindowLimiter("ApiWrite", o =>
+    {
+        o.PermitLimit = 60;
+        o.Window = TimeSpan.FromMinutes(1);
+        o.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        o.QueueLimit = 0; // reject immediately — do not queue
+    });
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+});
+
+// ----- CORS (TRD §8.7) -----
+// Deny-all by default; configure Cors:AllowedOrigins in environment settings.
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowedOrigins", policy =>
+        policy
+            .WithOrigins(
+                builder.Configuration.GetSection("Cors:AllowedOrigins")
+                       .Get<string[]>() ?? [])
+            .AllowAnyHeader()
+            .AllowAnyMethod());
+});
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(options =>
@@ -82,10 +112,23 @@ else
         .AddMicrosoftIdentityWebApi(builder.Configuration.GetSection("AzureAd"));
 }
 
+// TRD §8.1: Use RequireAssertion to handle both individual "scp" claims and
+// space-delimited single-claim format that Entra ID may emit.
+// RequireClaim("scp", "api.read") performs an exact-value match and silently
+// fails when scopes arrive as a single space-separated string.
 builder.Services.AddAuthorization(options =>
 {
-    options.AddPolicy("Api.Read", policy => policy.RequireClaim("scp", "api.read"));
-    options.AddPolicy("Api.Write", policy => policy.RequireClaim("scp", "api.write"));
+    options.AddPolicy("Api.Read", policy =>
+        policy.RequireAssertion(ctx =>
+            ctx.User.FindAll("scp").Any(c =>
+                c.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                 .Contains("api.read", StringComparer.OrdinalIgnoreCase))));
+
+    options.AddPolicy("Api.Write", policy =>
+        policy.RequireAssertion(ctx =>
+            ctx.User.FindAll("scp").Any(c =>
+                c.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                 .Contains("api.write", StringComparer.OrdinalIgnoreCase))));
 });
 
 // ----- Validation (manual — see controllers) -----
@@ -156,6 +199,17 @@ var app = builder.Build();
 await app.InitializeDatabaseAsync();
 
 // ----- Pipeline -----
+
+// Security headers (TRD §8.6) — applied before all other middleware so every
+// response (including error responses) carries these headers.
+app.Use(async (context, next) =>
+{
+    context.Response.Headers.Append("X-Content-Type-Options", "nosniff");
+    context.Response.Headers.Append("X-Frame-Options", "DENY");
+    context.Response.Headers.Append("Cache-Control", "no-store");
+    await next(context);
+});
+
 app.UseSerilogRequestLogging();
 
 // Centralized exception handler — translates domain exceptions to RFC 7807 ProblemDetails.
@@ -215,6 +269,9 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+
+app.UseCors("AllowedOrigins");  // TRD §8.7 — before auth so preflight OPTIONS succeeds
+app.UseRateLimiter();            // TRD §8.5
 
 app.UseAuthentication();
 app.UseAuthorization();

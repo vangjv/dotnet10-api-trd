@@ -101,12 +101,31 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
 **Must**
 - Use **Managed Identity** for Azure resources where supported (Key Vault, Azure SQL with AAD, App Configuration).
 - Configure **ingress** to HTTPS only; TLS terminated at platform edge.
+- Include a **`.dockerignore`** file to prevent tests, docs, `.git`, `bin/`, and `obj/` directories from entering the build context. Without this, `COPY . .` adds unnecessary files that bust layer cache and may include sensitive artifacts.
+
+  **Minimum `.dockerignore`:**
+  ```
+  **/.git
+  **/.vs
+  **/bin
+  **/obj
+  **/TestResults
+  tests/
+  docs/
+  **.md
+  ```
 
 ### 3.2 Configuration and secrets
 **Must**
 - Use **Azure App Configuration** for non-secret configuration (recommended).
 - Use **Azure Key Vault** for secrets. No secrets in code, images, or plain environment variables outside approved secret mounts.
 - Validate required configuration at startup; fail fast with clear error.
+- **Never commit placeholder values** (e.g., `YOUR_TENANT_ID`, `YOUR_CLIENT_ID`) in checked-in configuration files. Use:
+  - Empty strings in `appsettings.json` for required Entra ID values.
+  - `.NET User Secrets` (`dotnet user-secrets set "AzureAd:TenantId" "<guid>"`) for local development overrides.
+  - Environment variables (e.g., `AzureAd__TenantId`) for containers, CI, and staging.
+
+  Placeholder text in committed files is a stepping stone to accidentally committing real credentials.
 
 ### 3.3 Deployment strategy
 **Must**
@@ -457,6 +476,17 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
   // ❌ Wrong — only affects minimal APIs, not MVC controllers
   // builder.Services.ConfigureHttpJsonOptions(...);
   ```
+- All **mutation endpoints** (POST, PUT, PATCH) **must** declare `[Consumes("application/json")]`. Without this, the framework accepts requests with any `Content-Type`, producing unpredictable binding behaviour and misleading OpenAPI docs.
+
+  ```csharp
+  // ✅ Correct — declares accepted content type explicitly
+  [HttpPost]
+  [Produces("application/json")]
+  [Consumes("application/json")]
+  [ProducesResponseType(typeof(MyResponse), StatusCodes.Status201Created)]
+  [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
+  public async Task<IActionResult> Create([FromBody] CreateRequest request, ...) { ... }
+  ```
 
 ---
 
@@ -530,6 +560,19 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
 **Must**
 - Validate issuer, audience, signature, expiry, and required scopes.
 - Disable weak algorithms and reject unsigned tokens.
+- **Scope claim format:** Entra ID may emit scopes as either individual claims or as a **single space-delimited string** (e.g., `"scp": "api.read api.write"`). `RequireClaim("scp", "api.read")` performs an exact-value match and **silently fails** when scopes are space-delimited. Use `RequireAssertion` to handle both formats:
+
+  ```csharp
+  // ✅ Handles both individual claims and space-delimited single claims
+  options.AddPolicy("Api.Read", policy =>
+      policy.RequireAssertion(ctx =>
+          ctx.User.FindAll("scp").Any(c =>
+              c.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+               .Contains("api.read", StringComparer.OrdinalIgnoreCase))));
+
+  // ❌ Wrong — silently fails when Entra emits space-delimited scopes
+  // options.AddPolicy("Api.Read", policy => policy.RequireClaim("scp", "api.read"));
+  ```
 
 ### 8.2 Authorization
 **Must**
@@ -555,6 +598,93 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
 **Must**
 - Maintain a PII field inventory and logging redaction rules.
 - Audit log security-relevant events (permission changes, admin actions).
+
+### 8.5 Rate limiting
+**Must**
+- Apply rate limiting to protect write endpoints from abuse (flooding, credential-stuffed tokens).
+- Use `Microsoft.AspNetCore.RateLimiting` (built-in since .NET 7 — no additional NuGet package needed).
+- Return **HTTP 429 Too Many Requests** when the limit is exceeded.
+- Define at minimum a **fixed-window** policy for write operations; tune limits per service capacity.
+
+  ```csharp
+  // Program.cs — service registration
+  builder.Services.AddRateLimiter(options =>
+  {
+      options.AddFixedWindowLimiter("ApiWrite", o =>
+      {
+          o.PermitLimit = 60;
+          o.Window = TimeSpan.FromMinutes(1);
+          o.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+          o.QueueLimit = 0; // no queuing — reject immediately
+      });
+      options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+  });
+
+  // Program.cs — pipeline (before UseAuthentication)
+  app.UseRateLimiter();
+  ```
+
+  Apply to write controllers or actions:
+  ```csharp
+  [HttpPost]
+  [EnableRateLimiting("ApiWrite")]
+  public async Task<IActionResult> Create(...) { ... }
+  ```
+
+### 8.6 Security headers
+**Must**
+- Return the following HTTP response headers on all API responses:
+  - `X-Content-Type-Options: nosniff` — prevents MIME-type sniffing.
+  - `X-Frame-Options: DENY` — prevents clickjacking via iframes.
+  - `Cache-Control: no-store` — prevents sensitive API responses from being cached.
+- Add as early-pipeline middleware so headers are present on all responses including errors.
+
+  ```csharp
+  // Program.cs — early in pipeline, before UseSerilogRequestLogging
+  app.Use(async (context, next) =>
+  {
+      context.Response.Headers.Append("X-Content-Type-Options", "nosniff");
+      context.Response.Headers.Append("X-Frame-Options", "DENY");
+      context.Response.Headers.Append("Cache-Control", "no-store");
+      await next(context);
+  });
+  ```
+
+  > **Note:** HSTS is handled at the Azure Container Apps ingress (TLS terminated at platform edge — TRD §3.1). Do not add it to middleware when running behind an ACA-managed reverse proxy.
+
+### 8.7 CORS
+**Must**
+- Configure an explicit CORS policy — **never** use `AllowAnyOrigin()` in production.
+- Default to **deny-all** (empty origins list) if no browser clients are known.
+- When browser clients are required, serve an **allowlist from configuration** — not hard-coded strings.
+
+  ```csharp
+  // Program.cs — service registration
+  builder.Services.AddCors(options =>
+  {
+      options.AddPolicy("AllowedOrigins", policy =>
+          policy
+              .WithOrigins(
+                  builder.Configuration.GetSection("Cors:AllowedOrigins")
+                         .Get<string[]>() ?? [])
+              .AllowAnyHeader()
+              .AllowAnyMethod());
+  });
+
+  // Program.cs — pipeline (before UseAuthentication)
+  app.UseCors("AllowedOrigins");
+  ```
+
+  ```json
+  // appsettings.json — safe default: no origins allowed
+  {
+    "Cors": {
+      "AllowedOrigins": []
+    }
+  }
+  ```
+
+  > ⚠️ An empty `AllowedOrigins` array means **no browser origins are allowed** — this is the safe default for API-only services. Override per environment via environment variables: `Cors__AllowedOrigins__0=https://app.example.com`.
 
 ---
 

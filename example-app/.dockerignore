@@ -1,0 +1,30 @@
+# TRD §3.1 — exclude build artifacts, test projects, version control, and docs
+# from the Docker build context so COPY . . does not bust layer cache or
+# include unnecessary files in the image.
+
+# VCS and IDE
+**/.git
+**/.vs
+**/.vscode
+**/.idea
+
+# Build outputs (dotnet restore/publish writes to obj/ and bin/ inside the container)
+**/bin/
+**/obj/
+
+# Test projects and results
+tests/
+**/TestResults/
+
+# Documentation and development-only files
+**.md
+docs/
+*.md
+
+# User secrets and environment-specific overrides
+**/appsettings.*.json
+!**/appsettings.json
+!**/appsettings.Development.json
+
+# NuGet local cache
+**/.nuget/
