@@ -1,6 +1,7 @@
 using Acme.TaskHub.Application.Interfaces;
 using Acme.TaskHub.Domain.Entities;
 using Acme.TaskHub.Domain.Enums;
+using Acme.TaskHub.Domain.Exceptions;
 using Microsoft.EntityFrameworkCore;
 
 namespace Acme.TaskHub.Infrastructure.Persistence.Repositories;
@@ -23,9 +24,8 @@ internal sealed class TodoItemRepository : ITodoItemRepository
     /// <inheritdoc />
     public async Task<TodoItem?> GetByIdAsync(Guid id, CancellationToken cancellationToken = default)
     {
-        return await _db.TodoItems
-            .FirstOrDefaultAsync(x => x.Id == id, cancellationToken)
-            .ConfigureAwait(false);
+        // FindAsync checks the identity map before hitting the database (TRD §11.4).
+        return await _db.TodoItems.FindAsync([id], cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -51,8 +51,11 @@ internal sealed class TodoItemRepository : ITodoItemRepository
 
         if (!string.IsNullOrWhiteSpace(searchTerm))
         {
-            string term = searchTerm.Trim().ToLowerInvariant();
-            query = query.Where(x => x.Title.ToLower().Contains(term));
+            // EF.Functions.Like is index-friendly and case-insensitive on SQLite/SQL Server
+            // (SQLite LIKE is case-insensitive for ASCII; SQL Server uses column collation).
+            // Avoid ToLower().Contains() which forces a per-row function, bypassing indexes (TRD §11.4).
+            string pattern = $"%{searchTerm.Trim()}%";
+            query = query.Where(x => EF.Functions.Like(x.Title, pattern));
         }
 
         int totalCount = await query.CountAsync(cancellationToken).ConfigureAwait(false);
@@ -77,24 +80,32 @@ internal sealed class TodoItemRepository : ITodoItemRepository
     /// <inheritdoc />
     public async Task UpdateAsync(TodoItem item, CancellationToken cancellationToken = default)
     {
-        _db.TodoItems.Update(item);
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        // The entity was loaded via FindAsync and is already tracked by EF Core.
+        // Calling Update() would mark every column dirty — let the change tracker
+        // detect only the actually modified properties instead (TRD §11.4).
+        try
+        {
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            // Translate to a domain exception so the Application layer does not need
+            // an EF Core reference. The global handler maps DomainException → 409 (TRD §11.4).
+            throw new DomainException(
+                "CONCURRENCY_CONFLICT",
+                "The item was modified by another request. Fetch the latest version and retry.");
+        }
     }
 
     /// <inheritdoc />
     public async Task<bool> DeleteAsync(Guid id, CancellationToken cancellationToken = default)
     {
-        var item = await _db.TodoItems
-            .FirstOrDefaultAsync(x => x.Id == id, cancellationToken)
+        // ExecuteDeleteAsync issues a single DELETE statement with no SELECT round-trip (TRD §11.4).
+        int affected = await _db.TodoItems
+            .Where(x => x.Id == id)
+            .ExecuteDeleteAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        if (item is null)
-        {
-            return false;
-        }
-
-        _db.TodoItems.Remove(item);
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        return true;
+        return affected > 0;
     }
 }

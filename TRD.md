@@ -407,7 +407,16 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
   // IEntityTypeConfiguration<T>
   builder.Property(x => x.RowVersion).IsRowVersion();
   ```
-- Services should catch `DbUpdateConcurrencyException` and translate it to HTTP 409 Conflict.
+- **Repositories** should catch `DbUpdateConcurrencyException` from `SaveChangesAsync` and rethrow as a `DomainException` with code `CONCURRENCY_CONFLICT`. This keeps EF Core concerns out of the Application layer, which must not reference EF Core packages (§5.1). The global exception handler maps `DomainException` → HTTP 409 Conflict automatically (§7.2):
+  ```csharp
+  catch (DbUpdateConcurrencyException)
+  {
+      throw new DomainException(
+          "CONCURRENCY_CONFLICT",
+          "The item was modified by another request. Fetch the latest version and retry.");
+  }
+  ```
+  > ⚠️ **Never** catch `DbUpdateConcurrencyException` in the Application service layer — doing so requires adding an EF Core reference to the Application project, which violates the dependency rules.
 
 ### 5.6 Infrastructure layer rules
 **Must**
@@ -421,13 +430,18 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
   {
       using var scope = host.Services.CreateScope();
       var env = scope.ServiceProvider.GetRequiredService<IHostEnvironment>();
+
       if (env.IsDevelopment())
       {
           var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-          await db.Database.EnsureCreatedAsync().ConfigureAwait(false);
+          // MigrateAsync applies any pending migrations and creates the database
+          // if it does not yet exist. Use this in preference to EnsureCreatedAsync
+          // once any migration has been added — the two are mutually exclusive.
+          await db.Database.MigrateAsync().ConfigureAwait(false);
       }
   }
   ```
+  > ⚠️ `EnsureCreated` and EF Core migrations are **mutually exclusive**. `EnsureCreated` creates the schema directly from the model and marks it as having no migrations, preventing future `dotnet ef migrations add` from working correctly. Once any migration has been created, always use `MigrateAsync`.
 - **Use `ApplyConfigurationsFromAssembly(Assembly.GetExecutingAssembly())`** in `OnModelCreating` to auto-discover all `IEntityTypeConfiguration<T>` implementations. This avoids having to manually register each entity configuration:
   ```csharp
   protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -753,16 +767,121 @@ ENTRYPOINT ["dotnet", "Company.Product.Service.Api.dll"]
   - Apply via controlled pipeline step with approvals.
 - Never auto-migrate on startup in production.
 
-**Development/testing exception:**
-- `EnsureCreated()` or `EnsureCreatedAsync()` is acceptable in **Development** and **test** environments for rapid iteration.
-- Guard with an environment check: only call `EnsureCreated` when `IsDevelopment()` is true.
-- The migration infrastructure (EF Core Design package, migrations folder) must still exist in source control even if not used at dev time.
+**Development environment:**
+- In Development, call `MigrateAsync()` inside `InitializeDatabaseAsync(this IHost)` (defined in the Infrastructure layer) to apply pending migrations automatically and create the database if absent. This is safe, idempotent, and consistent with the migration strategy.
+- **Never** use `EnsureCreated()` / `EnsureCreatedAsync()` once any migration has been added — they are mutually exclusive with EF Core migrations. `EnsureCreated` creates the schema directly from the current model state and marks the database as having no migration history, which prevents `dotnet ef migrations add` from functioning correctly on that database.
+  ```csharp
+  // ✅ Correct — applies pending migrations; creates DB if absent
+  await db.Database.MigrateAsync().ConfigureAwait(false);
+
+  // ❌ Wrong — conflicts with migration history; use only before any migration exists
+  // await db.Database.EnsureCreatedAsync().ConfigureAwait(false);
+  ```
+- The migrations folder (`Migrations/`) and EF Core Design package must always be present in source control.
 
 ### 11.3 Query performance
 **Must**
-- Use `.AsNoTracking()` for read-only queries.
+- Use `.AsNoTracking()` for read-only queries to reduce change-tracking allocations.
 - Avoid N+1 queries; use `Include` judiciously and project to DTOs.
-- Index critical query paths and validate with query plans.
+- Index critical query paths (status, priority, date fields) and validate with query plans.
+
+### 11.4 Repository implementation patterns
+
+**PK lookups — use `FindAsync`**
+- Use `FindAsync` for primary-key lookups instead of `FirstOrDefaultAsync(x => x.Id == id)`.
+- `FindAsync` checks the EF Core identity map first; if the entity is already tracked it returns immediately without a database round-trip.
+  ```csharp
+  // ✅ Correct — identity-map aware, efficient PK lookup
+  return await _db.Items.FindAsync([id], cancellationToken).ConfigureAwait(false);
+
+  // ❌ Wrong — always hits the database; bypasses identity map
+  // return await _db.Items.FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
+  ```
+- `FindAsync` returns a **tracked** entity. This is intentional for write paths where the entity will be mutated and saved.
+
+**String search — use `EF.Functions.Like` instead of `ToLower()`**
+- `x.Title.ToLower().Contains(term)` forces a per-row function call in SQL, preventing index usage.
+- Use `EF.Functions.Like`. SQLite's `LIKE` is case-insensitive for ASCII; SQL Server uses the column collation. Both are index-friendly:
+  ```csharp
+  // ✅ Correct — index-friendly; no per-row function
+  query = query.Where(x => EF.Functions.Like(x.Title, $"%{searchTerm.Trim()}%"));
+
+  // ❌ Wrong — per-row ToLower() forces a full scan and bypasses column indexes
+  // string term = searchTerm.Trim().ToLowerInvariant();
+  // query = query.Where(x => x.Title.ToLower().Contains(term));
+  ```
+
+**Tracked entities — do not call `Update()` when already tracked**
+- When an entity is loaded via `FindAsync` or any non-`AsNoTracking` query, EF Core already tracks it. Calling `dbSet.Update(entity)` marks **all** properties as modified, generating a `SET` clause that touches every column — even unchanged ones.
+- Do **not** call `Update()` on a tracked entity. Mutate it through domain methods and call `SaveChangesAsync()`. The change tracker will detect only the actually modified properties:
+  ```csharp
+  // ✅ Correct — change tracker detects modifications; only dirty columns written
+  public async Task UpdateAsync(MyEntity entity, CancellationToken ct = default)
+  {
+      await _db.SaveChangesAsync(ct).ConfigureAwait(false);
+  }
+
+  // ❌ Wrong — marks every column dirty even if one field changed
+  // _db.MyEntities.Update(entity);
+  // await _db.SaveChangesAsync(ct).ConfigureAwait(false);
+  ```
+
+**Deletes — use `ExecuteDeleteAsync` (EF Core 7+)**
+- `ExecuteDeleteAsync` issues a single `DELETE FROM … WHERE` statement with no `SELECT` round-trip:
+  ```csharp
+  // ✅ Correct — single DELETE statement; no SELECT round-trip
+  int affected = await _db.Items
+      .Where(x => x.Id == id)
+      .ExecuteDeleteAsync(ct)
+      .ConfigureAwait(false);
+  return affected > 0;
+
+  // ❌ Wrong — loads the entity first, then deletes (two round-trips)
+  // var item = await _db.Items.FirstOrDefaultAsync(x => x.Id == id, ct);
+  // if (item is null) return false;
+  // _db.Items.Remove(item);
+  // await _db.SaveChangesAsync(ct);
+  ```
+  > **Note:** `ExecuteDeleteAsync` bypasses the change tracker and does not trigger `SaveChanges` interceptors or EF Core cascade-delete rules. Verify cascade behaviour before adopting.
+
+**Optimistic concurrency — catch at the repository boundary**
+- Catch `DbUpdateConcurrencyException` inside the repository's `UpdateAsync` and rethrow as a `DomainException`. This keeps EF Core out of the Application layer (§5.1):
+  ```csharp
+  public async Task UpdateAsync(MyEntity entity, CancellationToken ct = default)
+  {
+      try
+      {
+          await _db.SaveChangesAsync(ct).ConfigureAwait(false);
+      }
+      catch (DbUpdateConcurrencyException)
+      {
+          throw new DomainException(
+              "CONCURRENCY_CONFLICT",
+              "The item was modified by another request. Fetch the latest version and retry.");
+      }
+  }
+  ```
+  The global exception handler maps `DomainException` → HTTP 409 Conflict (§7.2).
+
+### 11.5 Fluent API entity configuration
+
+**Must**
+- Define all field-length limits (`MaxTitleLength`, etc.) as `public const` on the **domain entity** and reference them from both `IEntityTypeConfiguration<T>` and FluentValidation validators — **never duplicate literal values**.
+- Configure enum properties with `.HasConversion<string>().HasMaxLength(N)` for human-readable database values and to avoid `nvarchar(max)` columns.
+- Set `IsRequired()` on all non-nullable value properties.
+- Add supporting indexes for every commonly filtered or sorted column.
+- When using SQLite for local development, add a `ValueConverter` for `DateTimeOffset`/`DateTimeOffset?` (SQLite stores these as text by default, which loses timezone fidelity):
+  ```csharp
+  // Store as Unix milliseconds for correct round-trip fidelity
+  var dtConverter = new ValueConverter<DateTimeOffset, long>(
+      v => v.ToUnixTimeMilliseconds(),
+      v => DateTimeOffset.FromUnixTimeMilliseconds(v));
+
+  var nullableDtConverter = new ValueConverter<DateTimeOffset?, long?>(
+      v => v.HasValue ? v.Value.ToUnixTimeMilliseconds() : null,
+      v => v.HasValue ? DateTimeOffset.FromUnixTimeMilliseconds(v.Value) : null);
+  ```
+- **SQLite is development/test only.** It lacks native `DateTimeOffset`, `rowversion`, and several SQL Server features. Register it conditionally on the environment, and document the swap path to `UseSqlServer` / `UseAzureSql` for staging and production.
 
 ---
 

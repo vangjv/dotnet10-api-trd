@@ -43,9 +43,14 @@ public static class DependencyInjection
 
     /// <summary>
     /// Initializes the database for the current environment.
-    /// In Development, calls <c>EnsureCreatedAsync</c> for rapid iteration (TRD §11.2).
-    /// In all other environments this is a no-op; migrations are applied via the deployment pipeline.
+    /// In Development, calls <c>MigrateAsync</c> to apply pending migrations and create the
+    /// database if absent (TRD §11.2). In all other environments this is a no-op; migrations
+    /// are applied via the controlled deployment pipeline.
     /// </summary>
+    /// <remarks>
+    /// <c>EnsureCreated</c> and EF Core migrations are mutually exclusive — <c>EnsureCreated</c>
+    /// bypasses migration history and must not be used once any migration has been created.
+    /// </remarks>
     /// <param name="host">The application host.</param>
     public static async Task InitializeDatabaseAsync(this IHost host)
     {
@@ -57,7 +62,7 @@ public static class DependencyInjection
         if (env.IsDevelopment())
         {
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            await db.Database.EnsureCreatedAsync().ConfigureAwait(false);
+            await db.Database.MigrateAsync().ConfigureAwait(false);
         }
     }
 }
