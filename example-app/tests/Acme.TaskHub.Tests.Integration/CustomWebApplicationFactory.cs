@@ -43,11 +43,16 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Program>
                 services.Remove(descriptor);
             }
 
-            // Add an in-memory SQLite database for testing using the same connection string.
-            var connectionString = _keepAliveConnection.ConnectionString;
+            // Pass the connection *object* (not the connection string) so that EF Core
+            // reuses the single open SqliteConnection throughout migrations and all test
+            // queries. Using the string causes EF Core to open its own separate connections;
+            // across the multiple connection open/close cycles that MigrateAsync performs,
+            // SQLite shared-cache can leave tables visible to a new connection while the
+            // migration-history write from the previous connection hasn't been observed yet,
+            // producing "table TodoItems already exists" on the second migration batch.
             services.AddDbContext<AppDbContext>(options =>
             {
-                options.UseSqlite(connectionString);
+                options.UseSqlite(_keepAliveConnection);
             });
 
             // Schema is created by MigrateAsync in InitializeDatabaseAsync during
