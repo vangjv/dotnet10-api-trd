@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "dgSpecHash": "dW4TaXKOMDY=",
+  "success": false,
+  "projectFilePath": "C:\\Projects\\dotnet10-api-trd\\reference-structure\\tests\\Company.Product.Service.Tests.Integration\\Company.Product.Service.Tests.Integration.csproj",
+  "expectedPackageFiles": [],
+  "logs": [
+    {
+      "code": "NU1301",
+      "level": "Error",
+      "message": "Unable to load the service index for source https://fmgsuite-nuggets-562155477574.d.codeartifact.us-east-1.amazonaws.com/nuget/FMGNuget/v3/index.json.\r\n  Response status code does not indicate success: 401 (Unauthorized).",
+      "projectPath": "C:\\Projects\\dotnet10-api-trd\\reference-structure\\tests\\Company.Product.Service.Tests.Integration\\Company.Product.Service.Tests.Integration.csproj",
+      "filePath": "C:\\Projects\\dotnet10-api-trd\\reference-structure\\tests\\Company.Product.Service.Tests.Integration\\Company.Product.Service.Tests.Integration.csproj",
+      "targetGraphs": []
+    },
+    {
+      "code": "NU1301",
+      "level": "Error",
+      "message": "Unable to load the service index for source https://fmgsuite-nuggets-562155477574.d.codeartifact.us-east-1.amazonaws.com/nuget/FMGNuget/v3/index.json.\r\n  Response status code does not indicate success: 401 (Unauthorized).",
+      "projectPath": "C:\\Projects\\dotnet10-api-trd\\reference-structure\\tests\\Company.Product.Service.Tests.Integration\\Company.Product.Service.Tests.Integration.csproj",
+      "filePath": "C:\\Projects\\dotnet10-api-trd\\reference-structure\\tests\\Company.Product.Service.Tests.Integration\\Company.Product.Service.Tests.Integration.csproj",
+      "targetGraphs": []
+    }
+  ]
+}
