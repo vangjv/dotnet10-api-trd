@@ -11,6 +11,9 @@ import { HostedZone } from "aws-cdk-lib/aws-route53";
 import { CfnLoadBalancer, SslPolicy } from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as s3 from 'aws-cdk-lib/aws-s3'
 import { SubnetType } from "aws-cdk-lib/aws-ec2";
+import { addFargateTelemetry } from "./fargate-telemetry";
+
+const API_PORT = 8080;
 
 interface Request {
   stack: Construct;
@@ -62,8 +65,6 @@ export default function ({
     versioned: true
   });
 
-  settings.apiEnvVars["AWS__BucketName"] = bucket.bucketName;
-
   const image = ecs.ContainerImage.fromEcrRepository(repo, settings.imageTag);
 
   const applicationTaskDef = new ecs.FargateTaskDefinition(
@@ -76,39 +77,53 @@ export default function ({
   );
   bucket.grantReadWrite(applicationTaskDef.taskRole);
 
-  applicationTaskDef.addContainer("web", {
-    image,
+  const { router, containerOptions } = addFargateTelemetry(stack, {
+    task: applicationTaskDef,
     environment: {
       ...settings.apiEnvVars,
-      "DD_APM_ENABLED": "true",
-      "DD_SERVICE": "sidekick-api",
-      "DD_LOGS_INJECTION": "true",
-      "DD_LOGS_DIRECT_SUBMISSION_INTEGRATIONS": 'Serilog',
-      "DD_VERSION": settings.imageTag,
-      "DD_RUNTIME_METRICS_ENABLED": "true",
-      "DD_API_KEY": `{{resolve:secretsmanager:SidekickAPI_DD_API_KEY:SecretString}}`,
+      AWS__BucketName: bucket.bucketName,
+      ASPNETCORE_URLS: `http://+:${API_PORT}`,
     },
-    memoryReservationMiB: settings.memoryReservationMiB, // remaining memory for the buffer
-    containerName: "web",
-    portMappings: [
-      {
-        containerPort: 8080,
-      },
-    ],
-    logging: new ecs.AwsLogDriver({
-      streamPrefix: "application",
-    }),
+    env: settings.apiEnvVars.DD_ENV ?? "dev",
+    service: "sidekick-api",
+    version: settings.imageTag,
+    datadogSite: settings.datadogSite,
+    agentSecretName: settings.datadogAgentSecretName,
+    taskCpu: settings.containerCpu,
   });
 
-  applicationTaskDef.addContainer("dd-agent", {
-    containerName: 'datadog-agent',
-    image: ecs.ContainerImage.fromRegistry('public.ecr.aws/datadog/agent:latest'),
-    memoryReservationMiB: 512,
-    environment: {
-      'DD_API_KEY': `{{resolve:secretsmanager:SidekickAPI_DD_API_KEY:SecretString}}`,
-      'ECS_FARGATE': 'true'
+  const secrets: Record<string, ecs.Secret> = {};
+  if (settings.apiRuntimeSecrets) {
+    const { secretName, apiKeyCount } = settings.apiRuntimeSecrets;
+    const runtimeSecret = secretsmanager.Secret.fromSecretNameV2(
+      stack, "ApiRuntimeSecret", secretName
+    );
+    for (const name of [
+      "ConnectionStrings__Default",
+      ...Array.from({ length: apiKeyCount }, (_, index) => `ApiKey__Keys__${index}`),
+    ]) {
+      secrets[name] = ecs.Secret.fromSecretsManager(runtimeSecret, name);
+      delete containerOptions.environment[name];
+    }
+  }
+
+  const web = applicationTaskDef.addContainer("web", {
+    ...containerOptions,
+    image,
+    secrets,
+    memoryReservationMiB: settings.memoryReservationMiB, // remaining memory for the buffer
+    containerName: "web",
+    portMappings: [{ containerPort: API_PORT }],
+    healthCheck: {
+      command: ["CMD-SHELL", `curl -fsS --max-time 4 http://127.0.0.1:${API_PORT}/health/live > /dev/null`],
+      interval: cdk.Duration.seconds(30),
+      timeout: cdk.Duration.seconds(5),
+      retries: 3,
+      startPeriod: cdk.Duration.seconds(60),
     },
   });
+  web.addContainerDependencies({ container: router, condition: ecs.ContainerDependencyCondition.START });
+  applicationTaskDef.defaultContainer = web;
 
   const api = new ecsp.ApplicationLoadBalancedFargateService(
     stack,
@@ -133,8 +148,9 @@ export default function ({
   api.loadBalancer.setAttribute('idle_timeout.timeout_seconds', '180');
 
   api.targetGroup.configureHealthCheck({
-    path: "/swagger/index.html",
-    port: "8080",
+    path: "/health/ready",
+    port: "traffic-port",
+    healthyHttpCodes: "200",
   }); 
 
   // metric based auto scale

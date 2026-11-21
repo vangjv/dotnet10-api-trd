@@ -8,6 +8,7 @@ import * as schedulerTargets from "aws-cdk-lib/aws-scheduler-targets";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import Settings from "./settings";
 import grantSgAccess from "./grant-sg-access";
+import { addFargateTelemetry } from "./fargate-telemetry";
 
 interface Request {
   stack: Construct;
@@ -30,12 +31,6 @@ export default function ({
     repo,
     settings.workerImageTag
   );
-  const datadogApiKeySecret = secretsmanager.Secret.fromSecretNameV2(
-    stack,
-    "knowledgeBaseDatadogApiKeySecret",
-    "SidekickAPI_DD_API_KEY"
-  );
-
   const taskDefinition = new ecs.FargateTaskDefinition(
     stack,
     "knowledgeBaseWorkerTaskDef",
@@ -45,42 +40,23 @@ export default function ({
     }
   );
 
-  const ddEnv =
-    settings.workerEnvVars["DD_ENV"] ?? settings.apiEnvVars["DD_ENV"] ?? "dev";
-
-  taskDefinition.addContainer("worker", {
+  const { router, containerOptions } = addFargateTelemetry(stack, {
+    task: taskDefinition,
+    environment: settings.workerEnvVars,
+    env: settings.workerEnvVars.DD_ENV ?? settings.apiEnvVars.DD_ENV ?? "dev",
+    service: "sidekick-knowledge-base-ingestion",
+    version: settings.workerImageTag,
+    datadogSite: settings.datadogSite,
+    agentSecretName: settings.datadogAgentSecretName,
+    taskCpu: settings.containerCpu,
+  });
+  const worker = taskDefinition.addContainer("worker", {
+    ...containerOptions,
     image,
     containerName: "knowledge-base-worker",
-    environment: {
-      ...settings.workerEnvVars,
-      "DD_APM_ENABLED": "true",
-      "DD_SERVICE": "sidekick-knowledge-base-ingestion",
-      "DD_LOGS_INJECTION": "true",
-      "DD_LOGS_DIRECT_SUBMISSION_INTEGRATIONS": "Serilog",
-      "DD_VERSION": settings.workerImageTag,
-      "DD_RUNTIME_METRICS_ENABLED": "true",
-      "DD_ENV": ddEnv,
-    },
-    secrets: {
-      "DD_API_KEY": ecs.Secret.fromSecretsManager(datadogApiKeySecret),
-    },
     memoryReservationMiB: settings.memoryReservationMiB,
-    logging: new ecs.AwsLogDriver({
-      streamPrefix: "knowledge-base-ingestion",
-    }),
   });
-
-  taskDefinition.addContainer("dd-agent", {
-    containerName: "datadog-agent",
-    image: ecs.ContainerImage.fromRegistry("public.ecr.aws/datadog/agent:latest"),
-    memoryReservationMiB: 512,
-    environment: {
-      "ECS_FARGATE": "true",
-    },
-    secrets: {
-      "DD_API_KEY": ecs.Secret.fromSecretsManager(datadogApiKeySecret),
-    },
-  });
+  worker.addContainerDependencies({ container: router, condition: ecs.ContainerDependencyCondition.START });
 
   if (neededSecrets) {
     neededSecrets.forEach((secret) => secret.grantRead(taskDefinition.taskRole));

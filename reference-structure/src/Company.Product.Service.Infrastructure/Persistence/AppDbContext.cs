@@ -14,7 +14,7 @@ public sealed class AppDbContext : DbContext
         modelBuilder.Entity<Customer>(b =>
         {
             b.HasKey(x => x.Id);
-            b.Property(x => x.DisplayName).HasMaxLength(200).IsRequired();
+            b.Property(x => x.DisplayName).HasMaxLength(Customer.MaxDisplayNameLength).IsRequired();
         });
     }
 }

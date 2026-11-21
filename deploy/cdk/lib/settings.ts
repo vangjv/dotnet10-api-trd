@@ -18,6 +18,12 @@ export default interface Settings {
   vpcName: string;
   apiEnvVars: ApiEnvVars;
   workerEnvVars: ApiEnvVars;
+  datadogSite?: string;
+  datadogAgentSecretName?: string;
+  apiRuntimeSecrets?: {
+    secretName: string;
+    apiKeyCount: number;
+  };
   domainName?: string;
   subdomain?: string;
   dbSecurityGroupId: string;

@@ -4,6 +4,7 @@ import * as cdk from "aws-cdk-lib";
 import { SidekickStack } from "../lib/sidekick-stack";
 import { KnowledgeBaseIngestionStack } from "../lib/knowledge-base-ingestion-stack";
 import { KnowledgeBaseIngestionRepositoryStack } from "../lib/knowledge-base-ingestion-repository-stack";
+import Settings from "../lib/settings";
 
 const app = new cdk.App();
 const profile = app.node.tryGetContext("profile");
@@ -23,8 +24,10 @@ console.log('target: ' + target);
 
 var profileModuleUrl = `../lib/profiles/${profile}`;
 import(profileModuleUrl).then((module) => {
-  const settings = module.default(app);
-  console.log(settings);
+  const settings: Settings = module.default(app);
+  settings.datadogSite = app.node.tryGetContext("datadogSite") ?? settings.datadogSite;
+  settings.datadogAgentSecretName =
+    app.node.tryGetContext("datadogAgentSecretName") ?? settings.datadogAgentSecretName;
   const stackProps = {
     env: {
       account: process.env.CDK_DEFAULT_ACCOUNT,
@@ -33,9 +36,24 @@ import(profileModuleUrl).then((module) => {
   };
 
   switch (target) {
-    case "api":
+    case "api": {
+      const secretName = app.node.tryGetContext("apiRuntimeSecretName");
+      const keyCount = app.node.tryGetContext("apiKeyCount");
+      if (secretName !== undefined) {
+        if (typeof secretName !== "string" || !secretName.trim()) {
+          throw new Error("apiRuntimeSecretName must be an existing Secrets Manager name");
+        }
+        const apiKeyCount = Number(keyCount ?? 1);
+        if (!Number.isSafeInteger(apiKeyCount) || apiKeyCount < 1 || apiKeyCount > 10) {
+          throw new Error("apiKeyCount must be an integer from 1 to 10");
+        }
+        settings.apiRuntimeSecrets = { secretName, apiKeyCount };
+      } else if (keyCount !== undefined) {
+        throw new Error("apiKeyCount requires apiRuntimeSecretName");
+      }
       new SidekickStack(app, settings, stackProps);
       break;
+    }
     case "ingestion-repository":
       new KnowledgeBaseIngestionRepositoryStack(app, settings, stackProps);
       break;

@@ -36,7 +36,8 @@ These SLOs apply per service, per production environment, measured at the **API 
 
 **Availability**
 - **Monthly availability SLO:** **99.9%**
-- **Error budget:** ~43m 50s downtime/month
+- **SLI:** good requests divided by eligible requests at ingress over a calendar month. Count application-route requests, including ingress-generated 5xx and upstream timeouts. Exclude health checks and client-caused 4xx; include service-caused throttling (429). Count unclassified 4xx separately until they can be classified reliably.
+- **Error budget:** 0.1% of eligible requests, not a fixed number of minutes.
 
 **Latency (successful requests)**
 - **Read endpoints (GET/HEAD):** p95 **≤ 200 ms**, p99 **≤ 500 ms**
@@ -44,8 +45,8 @@ These SLOs apply per service, per production environment, measured at the **API 
 - **Search/list endpoints:** p95 **≤ 800 ms**, p99 **≤ 2000 ms** (with paging)
 
 **Reliability**
-- **5xx error rate:** **≤ 0.5%** (monthly)
-- **4xx rate:** monitored but not part of SLO (often client-caused); investigate sustained spikes
+- **5xx error rate:** monitor separately; ingress 5xx consume the same 0.1% availability error budget, not a separate allowance.
+- **4xx rate:** monitor separately and investigate sustained spikes.
 
 **Freshness**
 - Telemetry data should reach Datadog within **≤ 5 minutes** for operational usefulness.
@@ -70,7 +71,7 @@ These SLOs apply per service, per production environment, measured at the **API 
 ### 3.1 Container requirements
 **Must**
 - Build Linux containers.
-- Run as non-root user where feasible.
+- Run as non-root. Document and approve any exception.
 - Provide readiness and liveness probes, exposed as ALB target group / ECS container health checks:
   - `GET /health/live`
   - `GET /health/ready`
@@ -103,7 +104,7 @@ These SLOs apply per service, per production environment, measured at the **API 
 - Use immutable, version-pinned FireLens and Datadog Agent images or validated image digests. `latest` is prohibited outside local development.
 - Build container images once and promote the same image tag across environments (image tag passed as a CDK context parameter, e.g. `--context tag=<sha>`); never rebuild per environment.
 - Every deployment must be auditable and reproducible: rollouts are driven by CDK stack deploys of a specific, versioned image tag (rolling ECS/Fargate deployment).
-- Rollback = redeploy the prior known-good image tag via the same CDK stack/profile.
+- Rollback = redeploy the prior known-good image via the same CDK stack/profile. Use expand-and-contract migrations so both revisions can run against the expanded schema. Remove old columns or constraints only after the rollback window closes. Document and rehearse the recovery path for incompatible or irreversible changes.
 
 ### 3.4 Networking and security groups
 **Must**
@@ -130,22 +131,22 @@ These SLOs apply per service, per production environment, measured at the **API 
 
 ### 4.2 Authentication/Authorization (interim: API Key)
 - API key authentication implemented as a custom ASP.NET Core `AuthenticationHandler` validating a request header (default: `X-Api-Key`) against key(s) resolved from AWS Secrets Manager / Parameter Store at startup.
-- Policy-based authorization via `IAuthorizationPolicyProvider` / `AddAuthorization`; a default `RequireApiKey` policy is applied to all endpoints unless explicitly marked `[AllowAnonymous]` (e.g., health checks).
+- Register `RequireApiKey` through `AddAuthorization` and use it as the `FallbackPolicy` and `DefaultPolicy`. Anonymous endpoints must be explicitly marked `.AllowAnonymous()` or `[AllowAnonymous]`; policies that override the fallback must still require authentication unless approved.
 - **Must**
   - Reject requests with a missing or invalid key with `401` (Problem Details body, no key material echoed back).
   - Never log the raw API key value.
   - Support multiple concurrently valid keys per environment to allow zero-downtime key rotation.
   - Rate-limit or alert on repeated failed authentication attempts from the same source.
-- This is a **deliberate interim standard**. It must be revisited and matured 
+- This is a **deliberate interim standard**. Assign ownership for the transition to workload identity or OAuth 2.0 client credentials.
 
 ### 4.3 Data access
 - **Microsoft.EntityFrameworkCore**
 - Provider package per DB (e.g., **Microsoft.EntityFrameworkCore.SqlServer** for SQL Server / Amazon RDS for SQL Server)
 
 ### 4.4 Validation and mapping
-- **FluentValidation.AspNetCore** (request validation)
+- **FluentValidation** (request validation): invoke `ValidateAsync` explicitly and pass request cancellation. Do not use MVC's synchronous FluentValidation auto-validation.
 - Mapping:
-  - Approved: **AutoMapper** *or* **Mapster** (choose 1 per service; org default: AutoMapper)
+  - Prefer manual mapping for small DTOs. If justified, adopt **AutoMapper** or **Mapster**, not both.
 
 ### 4.5 Observability (Datadog)
 - **Datadog Agent** container, deployed as a sidecar alongside every Fargate task (per the CDK API/worker stack patterns), receiving APM traces and runtime metrics.
@@ -163,8 +164,7 @@ These SLOs apply per service, per production environment, measured at the **API 
 - Dashboards, monitors, log pipelines, indexes, facets, and SLO burn-rate tracking are configured as code where the organization's Datadog tooling permits. OpenTelemetry-to-Azure-Monitor exporters are **not used**.
 
 ### 4.6 Resilience
-- **Polly** (timeouts, retries, circuit breakers) using typed `HttpClient` policies
-  - Polly.Extensions.Http (if needed for helpers)
+- Use **Microsoft.Extensions.Http.Resilience** for typed `HttpClient` pipelines (timeouts, retries, circuit breakers). Configure budgets and retry eligibility explicitly rather than stacking independent retry policies.
 
 ### 4.7 Testing
 - **xUnit**
@@ -177,7 +177,7 @@ These SLOs apply per service, per production environment, measured at the **API 
 **Must**
 - Enable .NET analyzers + treat warnings as errors in CI.
 **Approved**
-- **Microsoft.CodeAnalysis.NetAnalyzers**
+- .NET SDK analyzers (default); extra analyzer packages only when needed.
 - **StyleCop.Analyzers** (optional but recommended)
 - **Roslynator.Analyzers** (optional)
 
@@ -190,6 +190,7 @@ These SLOs apply per service, per production environment, measured at the **API 
 - Dependencies flow inward:
   - `Api -> Application -> Domain`
   - `Infrastructure -> Application` (implements interfaces)
+  - `Api -> Infrastructure` only for dependency registration at the composition root; endpoints call Application, not Infrastructure.
 - `Domain` must not depend on EF Core or any external packages.
 
 ### 5.2 Reference repo layout (required)
@@ -213,7 +214,7 @@ These SLOs apply per service, per production environment, measured at the **API 
 - Controllers/minimal endpoints only orchestrate:
   - auth, validation, mapping, calling application services/handlers
 - No direct EF Core usage in controllers.
-- Standardize responses and errors (RFC 7807 Problem Details).
+- Standardize responses and errors (RFC 9457 Problem Details).
 - Provide OpenAPI descriptions for every endpoint.
 
 ### 5.4 Application layer rules
@@ -246,6 +247,7 @@ These SLOs apply per service, per production environment, measured at the **API 
   - Default page size: 50
   - Max page size: 200
 - Support `Idempotency-Key` for create operations that must tolerate retries.
+  - Scope it to the authenticated client (and tenant, when applicable) and operation. Define the retention period and request fingerprint. Record the result atomically with the write; a matching replay returns the original status, body and `Location`. Reusing the key with a different payload returns `409`. Document concurrent requests and expiry behavior.
 
 ### 6.2 Versioning and deprecation
 **Must**
@@ -256,7 +258,7 @@ These SLOs apply per service, per production environment, measured at the **API 
 
 ### 6.3 Content negotiation
 **Must**
-- `application/json` only unless exception approved.
+- Use `application/json` for success bodies and `application/problem+json` for errors, unless an exception is approved.
 - Use `System.Text.Json` with deterministic settings (camelCase, enums as strings if chosen).
 
 ---
@@ -265,8 +267,8 @@ These SLOs apply per service, per production environment, measured at the **API 
 
 ### 7.1 Standard error format
 **Must**
-- Return RFC7807 Problem Details (or an org-approved envelope) including:
-  - `traceId` (from current Activity)
+- Return RFC 9457 Problem Details for API validation, authentication, authorization, not-found and exception responses:
+  - `traceId` (W3C `Activity.TraceId`, not the whole `Activity.Id`); use a separate `requestId` field if no W3C activity exists.
   - stable `errorCode`
   - field errors for validation failures
 
@@ -294,7 +296,7 @@ These SLOs apply per service, per production environment, measured at the **API 
 
 ### 8.2 Authorization
 **Must**
-- Policy-based authorization; default deny — endpoints explicitly require a policy (currently `RequireApiKey`).
+- Policy-based authorization; default deny through `FallbackPolicy`. Require explicit authorization when a more restrictive policy applies and explicit opt-out for anonymous endpoints.
 
 **Should** (future maturity)
 - Scope/role-based checks once a richer identity model is adopted.
@@ -450,12 +452,12 @@ Schema rules:
 ### 10.1 Timeouts
 **Must**
 - Every outbound dependency call has a timeout:
-  - HTTP default timeout: 10s (override per dependency)
+  - HTTP default total timeout: 10s including retries and backoff (override per dependency); set a shorter per-attempt timeout and honor request cancellation. Keep the total within the caller's remaining endpoint budget.
   - DB command timeout: 30s (override per query class)
 
 ### 10.2 Retries
 **Must**
-- Retries only for transient failures and idempotent operations.
+- Retries only for transient failures and idempotent operations. Disable retries on unsafe HTTP methods by default and opt in only where the downstream operation guarantees idempotency.
 - Use exponential backoff with jitter and max attempts:
   - max 3 retries for HTTP transient failures (5xx, timeouts, 429 where safe)
 
@@ -502,7 +504,7 @@ Schema rules:
 
 ### 13.1 Required checks on every PR
 **Must**
-- Build + unit tests
+- Clean-checkout restore, warnings-as-errors build, unit tests, and container publish using the supported .NET 10 SDK selected by `global.json`.
 - Integration tests (at least smoke integration)
 - Static analysis (analyzers) with warnings-as-errors
 - Dependency vulnerability scan
@@ -535,8 +537,8 @@ Schema rules:
 ### 14.1 Health checks
 **Must**
 - `/health/live` checks process health only.
-- `/health/ready` checks critical dependencies (Amazon RDS for SQL Server connectivity, AWS Secrets Manager access if required).
-- The ALB target group / ECS container health check should target `/health/ready`.
+- `/health/ready` checks critical runtime dependencies with a short timeout (e.g., Amazon RDS for SQL Server). Do not check Secrets Manager at runtime if secrets are only injected at task startup.
+- Use `/health/ready` for the ALB target group and `/health/live` for the ECS container health check.
 
 ### 14.2 Runbooks
 **Must**

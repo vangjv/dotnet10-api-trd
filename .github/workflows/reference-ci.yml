@@ -1,0 +1,57 @@
+name: Reference API CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  reference-api:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: reference-structure
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: reference-structure/global.json
+          dotnet-version: '10.0.x'
+      - run: dotnet restore -p:NuGetAuditMode=all
+      - run: dotnet build --configuration Release --no-restore
+      - name: Start disposable SQL Server
+        run: |
+          password="A9!$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          docker run -d --name reference-sql -p 127.0.0.1:1433:1433 \
+            -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD="$password" \
+            mcr.microsoft.com/mssql/server:2022-CU23-ubuntu-22.04
+          for attempt in {1..40}; do
+            if docker exec reference-sql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$password" -C -Q "SELECT 1" >/dev/null 2>&1; then
+              echo "REFERENCE_TEST_SQL_SERVER=Server=127.0.0.1,1433;User ID=sa;Password=$password;Encrypt=True;TrustServerCertificate=True" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 3
+          done
+          docker logs reference-sql
+          exit 1
+      - run: dotnet test --configuration Release --no-build
+      - run: docker build --platform linux/amd64 --tag reference-api:ci .
+  cdk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/cdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: deploy/cdk/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test -- --runInBand

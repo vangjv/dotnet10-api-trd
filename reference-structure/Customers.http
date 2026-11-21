@@ -1,0 +1,32 @@
+@baseUrl = http://localhost:5080
+@customerId = 8a533ea3-b804-474c-9460-b799c928cd02
+
+### Process liveness (anonymous)
+GET {{baseUrl}}/health/live
+
+### SQL readiness (anonymous)
+GET {{baseUrl}}/health/ready
+
+### OpenAPI (Development only)
+GET {{baseUrl}}/swagger/v1/swagger.json
+
+### Get a seeded customer
+GET {{baseUrl}}/v1/customers/{{customerId}}
+X-Api-Key: {{$processEnv REFERENCE_API_KEY}}
+
+### Replace the display name
+PUT {{baseUrl}}/v1/customers/{{customerId}}/display-name
+X-Api-Key: {{$processEnv REFERENCE_API_KEY}}
+Content-Type: application/json
+
+{ "displayName": "Northwind" }
+
+### Validation error
+PUT {{baseUrl}}/v1/customers/{{customerId}}/display-name
+X-Api-Key: {{$processEnv REFERENCE_API_KEY}}
+Content-Type: application/json
+
+{ "displayName": " " }
+
+### Missing key
+GET {{baseUrl}}/v1/customers/{{customerId}}
